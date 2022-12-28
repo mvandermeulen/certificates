@@ -2,16 +2,19 @@ package provisioner
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/randutil"
+
 	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/randutil"
-	"github.com/smallstep/cli/jose"
+	"github.com/smallstep/certificates/api/render"
 )
 
 func TestX5C_Getters(t *testing.T) {
@@ -69,8 +72,8 @@ func TestX5C_Init(t *testing.T) {
 		},
 		"fail/no-valid-root-certs": func(t *testing.T) ProvisionerValidateTest {
 			return ProvisionerValidateTest{
-				p:   &X5C{Name: "foo", Type: "bar", Roots: []byte("foo"), audiences: testAudiences},
-				err: errors.Errorf("no x509 certificates found in roots attribute for provisioner foo"),
+				p:   &X5C{Name: "foo", Type: "bar", Roots: []byte("foo")},
+				err: errors.New("no x509 certificates found in roots attribute for provisioner 'foo'"),
 			}
 		},
 		"fail/invalid-duration": func(t *testing.T) ProvisionerValidateTest {
@@ -79,7 +82,7 @@ func TestX5C_Init(t *testing.T) {
 			p.Claims = &Claims{DefaultTLSDur: &Duration{0}}
 			return ProvisionerValidateTest{
 				p:   p,
-				err: errors.New("claims: DefaultTLSCertDuration must be greater than 0"),
+				err: errors.New("claims: MinTLSCertDuration must be greater than 0"),
 			}
 		},
 		"ok": func(t *testing.T) ProvisionerValidateTest {
@@ -117,9 +120,11 @@ M46l92gdOozT
 			return ProvisionerValidateTest{
 				p: p,
 				extraValid: func(p *X5C) error {
+					//nolint:staticcheck // We don't have a different way to
+					// check the number of certificates in the pool.
 					numCerts := len(p.rootPool.Subjects())
 					if numCerts != 2 {
-						return errors.Errorf("unexpected number of certs: want 2, but got %d", numCerts)
+						return fmt.Errorf("unexpected number of certs: want 2, but got %d", numCerts)
 					}
 					return nil
 				},
@@ -141,7 +146,7 @@ M46l92gdOozT
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
-					assert.Equals(t, tc.p.audiences, config.Audiences.WithFragment(tc.p.GetID()))
+					assert.Equals(t, *tc.p.ctl.Audiences, config.Audiences.WithFragment(tc.p.GetID()))
 					if tc.extraValid != nil {
 						assert.Nil(t, tc.extraValid(tc.p))
 					}
@@ -154,7 +159,7 @@ M46l92gdOozT
 func TestX5C_authorizeToken(t *testing.T) {
 	x5cCerts, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	x5cJWK, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	x5cJWK, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	type test struct {
@@ -384,9 +389,10 @@ lgsqsR63is+0YQ==
 			tc := tt(t)
 			if claims, err := tc.p.authorizeToken(tc.token, testAudiences.Sign); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
@@ -402,7 +408,7 @@ lgsqsR63is+0YQ==
 func TestX5C_AuthorizeSign(t *testing.T) {
 	certs, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	jwk, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	jwk, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	type test struct {
@@ -455,26 +461,28 @@ func TestX5C_AuthorizeSign(t *testing.T) {
 			tc := tt(t)
 			if opts, err := tc.p.AuthorizeSign(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
-						assert.Equals(t, len(opts), 6)
+						assert.Equals(t, 10, len(opts))
 						for _, o := range opts {
 							switch v := o.(type) {
+							case *X5C:
+							case certificateOptionsFunc:
 							case *provisionerExtensionOption:
-								assert.Equals(t, v.Type, int(TypeX5C))
+								assert.Equals(t, v.Type, TypeX5C)
 								assert.Equals(t, v.Name, tc.p.GetName())
 								assert.Equals(t, v.CredentialID, "")
 								assert.Len(t, 0, v.KeyValuePairs)
 							case profileLimitDuration:
-								assert.Equals(t, v.def, tc.p.claimer.DefaultTLSCertDuration())
-
-								claims, err := tc.p.authorizeToken(tc.token, tc.p.audiences.Sign)
+								assert.Equals(t, v.def, tc.p.ctl.Claimer.DefaultTLSCertDuration())
+								claims, err := tc.p.authorizeToken(tc.token, tc.p.ctl.Audiences.Sign)
 								assert.FatalError(t, err)
 								assert.Equals(t, v.notAfter, claims.chains[0][0].NotAfter)
 							case commonNameValidator:
@@ -483,10 +491,14 @@ func TestX5C_AuthorizeSign(t *testing.T) {
 							case defaultSANsValidator:
 								assert.Equals(t, []string(v), tc.sans)
 							case *validityValidator:
-								assert.Equals(t, v.min, tc.p.claimer.MinTLSCertDuration())
-								assert.Equals(t, v.max, tc.p.claimer.MaxTLSCertDuration())
+								assert.Equals(t, v.min, tc.p.ctl.Claimer.MinTLSCertDuration())
+								assert.Equals(t, v.max, tc.p.ctl.Claimer.MaxTLSCertDuration())
+							case *x509NamePolicyValidator:
+								assert.Equals(t, nil, v.policyEngine)
+							case *WebhookController:
+								assert.Len(t, 0, v.webhooks)
 							default:
-								assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+								assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 							}
 						}
 					}
@@ -517,7 +529,7 @@ func TestX5C_AuthorizeRevoke(t *testing.T) {
 		"ok": func(t *testing.T) test {
 			certs, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 			assert.FatalError(t, err)
-			jwk, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+			jwk, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 			assert.FatalError(t, err)
 
 			p, err := generateX5C(nil)
@@ -537,9 +549,10 @@ func TestX5C_AuthorizeRevoke(t *testing.T) {
 			tc := tt(t)
 			if err := tc.p.AuthorizeRevoke(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
@@ -550,6 +563,7 @@ func TestX5C_AuthorizeRevoke(t *testing.T) {
 }
 
 func TestX5C_AuthorizeRenew(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
 	type test struct {
 		p    *X5C
 		code int
@@ -562,12 +576,12 @@ func TestX5C_AuthorizeRenew(t *testing.T) {
 			// disable renewal
 			disable := true
 			p.Claims = &Claims{DisableRenewal: &disable}
-			p.claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
+			p.ctl.Claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
 			assert.FatalError(t, err)
 			return test{
 				p:    p,
 				code: http.StatusUnauthorized,
-				err:  errors.Errorf("x5c.AuthorizeRenew; renew is disabled for x5c provisioner %s", p.GetID()),
+				err:  fmt.Errorf("renew is disabled for provisioner '%s'", p.GetName()),
 			}
 		},
 		"ok": func(t *testing.T) test {
@@ -581,11 +595,15 @@ func TestX5C_AuthorizeRenew(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			tc := tt(t)
-			if err := tc.p.AuthorizeRenew(context.Background(), nil); err != nil {
+			if err := tc.p.AuthorizeRenew(context.Background(), &x509.Certificate{
+				NotBefore: now,
+				NotAfter:  now.Add(time.Hour),
+			}); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
@@ -598,7 +616,7 @@ func TestX5C_AuthorizeRenew(t *testing.T) {
 func TestX5C_AuthorizeSSHSign(t *testing.T) {
 	x5cCerts, err := pemutil.ReadCertificateBundle("./testdata/certs/x5c-leaf.crt")
 	assert.FatalError(t, err)
-	x5cJWK, err := jose.ParseKey("./testdata/secrets/x5c-leaf.key")
+	x5cJWK, err := jose.ReadKey("./testdata/secrets/x5c-leaf.key")
 	assert.FatalError(t, err)
 
 	_, fn := mockNow()
@@ -617,13 +635,13 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 			// disable sshCA
 			enable := false
 			p.Claims = &Claims{EnableSSHCA: &enable}
-			p.claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
+			p.ctl.Claimer, err = NewClaimer(p.Claims, globalProvisionerClaims)
 			assert.FatalError(t, err)
 			return test{
 				p:     p,
 				token: "foo",
 				code:  http.StatusUnauthorized,
-				err:   errors.Errorf("x5c.AuthorizeSSHSign; sshCA is disabled for x5c provisioner %s", p.GetID()),
+				err:   fmt.Errorf("x5c.AuthorizeSSHSign; sshCA is disabled for x5c provisioner '%s'", p.GetName()),
 			}
 		},
 		"fail/invalid-token": func(t *testing.T) test {
@@ -695,8 +713,9 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 					Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
 					Audience:  []string{testAudiences.SSHSign[0]},
 				},
-				Step: &stepPayload{SSH: &SSHOptions{
+				Step: &stepPayload{SSH: &SignSSHOptions{
 					CertType:    SSHHostCert,
+					KeyID:       "foo",
 					Principals:  []string{"max", "mariano", "alan"},
 					ValidAfter:  TimeDuration{d: 5 * time.Minute},
 					ValidBefore: TimeDuration{d: 10 * time.Minute},
@@ -727,7 +746,7 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 					Expiry:    jose.NewNumericDate(now.Add(5 * time.Minute)),
 					Audience:  []string{testAudiences.SSHSign[0]},
 				},
-				Step: &stepPayload{SSH: &SSHOptions{}},
+				Step: &stepPayload{SSH: &SignSSHOptions{}},
 			}
 			tok, err := generateX5CSSHToken(x5cJWK, claims, withX5CHdr(x5cCerts))
 			assert.FatalError(t, err)
@@ -743,52 +762,56 @@ func TestX5C_AuthorizeSSHSign(t *testing.T) {
 			tc := tt(t)
 			if opts, err := tc.p.AuthorizeSSHSign(context.Background(), tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
-					assert.Equals(t, sc.StatusCode(), tc.code)
+					var sc render.StatusCodedError
+					if assert.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface") {
+						assert.Equals(t, sc.StatusCode(), tc.code)
+					}
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
 			} else {
 				if assert.Nil(t, tc.err) {
 					if assert.NotNil(t, opts) {
 						tot := 0
+						firstValidator := true
 						nw := now()
 						for _, o := range opts {
 							switch v := o.(type) {
+							case Interface:
 							case sshCertOptionsValidator:
 								tc.claims.Step.SSH.ValidAfter.t = time.Time{}
 								tc.claims.Step.SSH.ValidBefore.t = time.Time{}
-								assert.Equals(t, SSHOptions(v), *tc.claims.Step.SSH)
-							case sshCertKeyIDModifier:
-								assert.Equals(t, string(v), "foo")
-							case sshCertTypeModifier:
-								assert.Equals(t, string(v), tc.claims.Step.SSH.CertType)
-							case sshCertPrincipalsModifier:
-								assert.Equals(t, []string(v), tc.claims.Step.SSH.Principals)
+								if firstValidator {
+									assert.Equals(t, SignSSHOptions(v), *tc.claims.Step.SSH)
+								} else {
+									assert.Equals(t, SignSSHOptions(v), SignSSHOptions{KeyID: tc.claims.Subject})
+								}
+								firstValidator = false
 							case sshCertValidAfterModifier:
 								assert.Equals(t, int64(v), tc.claims.Step.SSH.ValidAfter.RelativeTime(nw).Unix())
 							case sshCertValidBeforeModifier:
 								assert.Equals(t, int64(v), tc.claims.Step.SSH.ValidBefore.RelativeTime(nw).Unix())
 							case sshCertDefaultsModifier:
-								assert.Equals(t, SSHOptions(v), SSHOptions{CertType: SSHUserCert})
+								assert.Equals(t, SignSSHOptions(v), SignSSHOptions{CertType: SSHUserCert})
 							case *sshLimitDuration:
-								assert.Equals(t, v.Claimer, tc.p.claimer)
+								assert.Equals(t, v.Claimer, tc.p.ctl.Claimer)
 								assert.Equals(t, v.NotAfter, x5cCerts[0].NotAfter)
 							case *sshCertValidityValidator:
-								assert.Equals(t, v.Claimer, tc.p.claimer)
-							case *sshDefaultExtensionModifier, *sshDefaultPublicKeyValidator,
-								*sshCertDefaultValidator:
-							case sshCertKeyIDValidator:
-								assert.Equals(t, string(v), "foo")
+								assert.Equals(t, v.Claimer, tc.p.ctl.Claimer)
+							case *sshNamePolicyValidator:
+								assert.Equals(t, nil, v.userPolicyEngine)
+								assert.Equals(t, nil, v.hostPolicyEngine)
+							case *sshDefaultPublicKeyValidator, *sshCertDefaultValidator, sshCertificateOptionsFunc:
+							case *WebhookController:
+								assert.Len(t, 0, v.webhooks)
 							default:
-								assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+								assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 							}
 							tot++
 						}
 						if len(tc.claims.Step.SSH.CertType) > 0 {
-							assert.Equals(t, tot, 13)
+							assert.Equals(t, tot, 12)
 						} else {
-							assert.Equals(t, tot, 9)
+							assert.Equals(t, tot, 10)
 						}
 					}
 				}

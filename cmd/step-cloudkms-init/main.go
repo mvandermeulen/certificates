@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -15,11 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/smallstep/certificates/kms/apiv1"
-	"github.com/smallstep/certificates/kms/cloudkms"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/ui"
-	"github.com/smallstep/cli/utils"
+	"go.step.sm/cli-utils/fileutil"
+	"go.step.sm/cli-utils/ui"
+	"go.step.sm/crypto/kms/apiv1"
+	"go.step.sm/crypto/kms/cloudkms"
+	"go.step.sm/crypto/pemutil"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -27,13 +27,13 @@ func main() {
 	var credentialsFile string
 	var project, location, ring string
 	var protectionLevelName string
-	var ssh bool
+	var enableSSH bool
 	flag.StringVar(&credentialsFile, "credentials-file", "", "Path to the `file` containing the Google's Cloud KMS credentials.")
 	flag.StringVar(&project, "project", "", "Google Cloud Project ID.")
 	flag.StringVar(&location, "location", "global", "Cloud KMS location name.")
 	flag.StringVar(&ring, "ring", "pki", "Cloud KMS ring name.")
 	flag.StringVar(&protectionLevelName, "protection-level", "SOFTWARE", "Protection level to use, SOFTWARE or HSM.")
-	flag.BoolVar(&ssh, "ssh", false, "Create SSH keys.")
+	flag.BoolVar(&enableSSH, "ssh", false, "Create SSH keys.")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -62,8 +62,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize windows terminal
+	ui.Init()
+
+	ui.Println("⚠️  This command is deprecated and will be removed in future releases.")
+	ui.Println("⚠️  Please use https://github.com/smallstep/step-kms-plugin instead.")
+
 	c, err := cloudkms.New(context.Background(), apiv1.Options{
-		Type:            string(apiv1.CloudKMS),
+		Type:            apiv1.CloudKMS,
 		CredentialsFile: credentialsFile,
 	})
 	if err != nil {
@@ -74,16 +80,20 @@ func main() {
 		fatal(err)
 	}
 
-	if ssh {
+	if enableSSH {
 		ui.Println()
 		if err := createSSH(c, project, location, ring, protectionLevel); err != nil {
 			fatal(err)
 		}
 	}
+
+	// Reset windows terminal
+	ui.Reset()
 }
 
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, err)
+	ui.Reset()
 	os.Exit(1)
 }
 
@@ -98,10 +108,11 @@ This tool is experimental and in the future it will be integrated in step cli.
 OPTIONS`)
 	fmt.Fprintln(os.Stderr)
 	flag.PrintDefaults()
-	fmt.Fprintln(os.Stderr, `
+	fmt.Fprintf(os.Stderr, `
 COPYRIGHT
 
-  (c) 2018-2020 Smallstep Labs, Inc.`)
+  (c) 2018-%d Smallstep Labs, Inc.
+`, time.Now().Year())
 	os.Exit(1)
 }
 
@@ -146,7 +157,7 @@ func createPKI(c *cloudkms.CloudKMS, project, location, keyRing string, protecti
 		return err
 	}
 
-	if err = utils.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
+	if err := fileutil.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: b,
 	}), 0600); err != nil {
@@ -190,7 +201,7 @@ func createPKI(c *cloudkms.CloudKMS, project, location, keyRing string, protecti
 		return err
 	}
 
-	if err = utils.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
+	if err := fileutil.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: b,
 	}), 0600); err != nil {
@@ -223,7 +234,7 @@ func createSSH(c *cloudkms.CloudKMS, project, location, keyRing string, protecti
 		return err
 	}
 
-	if err = utils.WriteFile("ssh_user_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
+	if err := fileutil.WriteFile("ssh_user_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
 		return err
 	}
 
@@ -234,7 +245,7 @@ func createSSH(c *cloudkms.CloudKMS, project, location, keyRing string, protecti
 	resp, err = c.CreateKey(&apiv1.CreateKeyRequest{
 		Name:               parent + "/ssh-host-key",
 		SignatureAlgorithm: apiv1.ECDSAWithSHA256,
-		ProtectionLevel:    apiv1.Software,
+		ProtectionLevel:    protectionLevel,
 	})
 	if err != nil {
 		return err
@@ -245,7 +256,7 @@ func createSSH(c *cloudkms.CloudKMS, project, location, keyRing string, protecti
 		return err
 	}
 
-	if err = utils.WriteFile("ssh_host_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
+	if err := fileutil.WriteFile("ssh_host_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
 		return err
 	}
 
@@ -269,6 +280,7 @@ func mustSubjectKeyID(key crypto.PublicKey) []byte {
 	if err != nil {
 		panic(err)
 	}
+	//nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	hash := sha1.Sum(b)
 	return hash[:]
 }

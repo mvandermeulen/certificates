@@ -14,6 +14,10 @@ func (p *noop) GetID() string {
 	return "noop"
 }
 
+func (p *noop) GetIDForToken() string {
+	return "noop"
+}
+
 func (p *noop) GetTokenID(token string) (string, error) {
 	return "", nil
 }
@@ -25,7 +29,7 @@ func (p *noop) GetType() Type {
 	return noopType
 }
 
-func (p *noop) GetEncryptedKey() (kid string, key string, ok bool) {
+func (p *noop) GetEncryptedKey() (kid, key string, ok bool) {
 	return "", "", false
 }
 
@@ -34,7 +38,7 @@ func (p *noop) Init(config Config) error {
 }
 
 func (p *noop) AuthorizeSign(ctx context.Context, token string) ([]SignOption, error) {
-	return []SignOption{}, nil
+	return []SignOption{p}, nil
 }
 
 func (p *noop) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
@@ -46,10 +50,11 @@ func (p *noop) AuthorizeRevoke(ctx context.Context, token string) error {
 }
 
 func (p *noop) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption, error) {
-	return []SignOption{}, nil
+	return []SignOption{p}, nil
 }
 
 func (p *noop) AuthorizeSSHRenew(ctx context.Context, token string) (*ssh.Certificate, error) {
+	//nolint:nilnil // fine for noop
 	return nil, nil
 }
 

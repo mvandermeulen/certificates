@@ -4,18 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/dsa"
+	"crypto/dsa" //nolint
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -26,16 +28,17 @@ import (
 
 	"github.com/go-chi/chi"
 	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh"
+
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/x509util"
+
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
-	"github.com/smallstep/certificates/sshutil"
 	"github.com/smallstep/certificates/templates"
-	"github.com/smallstep/cli/crypto/tlsutil"
-	"github.com/smallstep/cli/jose"
-	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -168,6 +171,240 @@ func parseCertificateRequest(data string) *x509.CertificateRequest {
 	return csr
 }
 
+func mockMustAuthority(t *testing.T, a Authority) {
+	t.Helper()
+	fn := mustAuthority
+	t.Cleanup(func() {
+		mustAuthority = fn
+	})
+	mustAuthority = func(ctx context.Context) Authority {
+		return a
+	}
+}
+
+type mockAuthority struct {
+	ret1, ret2                   interface{}
+	err                          error
+	authorize                    func(ctx context.Context, ott string) ([]provisioner.SignOption, error)
+	authorizeRenewToken          func(ctx context.Context, ott string) (*x509.Certificate, error)
+	getTLSOptions                func() *authority.TLSOptions
+	root                         func(shasum string) (*x509.Certificate, error)
+	sign                         func(cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
+	renew                        func(cert *x509.Certificate) ([]*x509.Certificate, error)
+	rekey                        func(oldCert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
+	renewContext                 func(ctx context.Context, oldCert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
+	loadProvisionerByCertificate func(cert *x509.Certificate) (provisioner.Interface, error)
+	loadProvisionerByName        func(name string) (provisioner.Interface, error)
+	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
+	revoke                       func(context.Context, *authority.RevokeOptions) error
+	getEncryptedKey              func(kid string) (string, error)
+	getRoots                     func() ([]*x509.Certificate, error)
+	getFederation                func() ([]*x509.Certificate, error)
+	getCRL                       func() ([]byte, error)
+	signSSH                      func(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	signSSHAddUser               func(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
+	renewSSH                     func(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error)
+	rekeySSH                     func(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
+	getSSHHosts                  func(ctx context.Context, cert *x509.Certificate) ([]authority.Host, error)
+	getSSHRoots                  func(ctx context.Context) (*authority.SSHKeys, error)
+	getSSHFederation             func(ctx context.Context) (*authority.SSHKeys, error)
+	getSSHConfig                 func(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error)
+	checkSSHHost                 func(ctx context.Context, principal, token string) (bool, error)
+	getSSHBastion                func(ctx context.Context, user string, hostname string) (*authority.Bastion, error)
+	version                      func() authority.Version
+}
+
+func (m *mockAuthority) GetCertificateRevocationList() ([]byte, error) {
+	if m.getCRL != nil {
+		return m.getCRL()
+	}
+
+	return m.ret1.([]byte), m.err
+}
+
+// TODO: remove once Authorize is deprecated.
+func (m *mockAuthority) Authorize(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
+	if m.authorize != nil {
+		return m.authorize(ctx, ott)
+	}
+	return m.ret1.([]provisioner.SignOption), m.err
+}
+
+func (m *mockAuthority) AuthorizeRenewToken(ctx context.Context, ott string) (*x509.Certificate, error) {
+	if m.authorizeRenewToken != nil {
+		return m.authorizeRenewToken(ctx, ott)
+	}
+	return m.ret1.(*x509.Certificate), m.err
+}
+
+func (m *mockAuthority) GetTLSOptions() *authority.TLSOptions {
+	if m.getTLSOptions != nil {
+		return m.getTLSOptions()
+	}
+	return m.ret1.(*authority.TLSOptions)
+}
+
+func (m *mockAuthority) Root(shasum string) (*x509.Certificate, error) {
+	if m.root != nil {
+		return m.root(shasum)
+	}
+	return m.ret1.(*x509.Certificate), m.err
+}
+
+func (m *mockAuthority) Sign(cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
+	if m.sign != nil {
+		return m.sign(cr, opts, signOpts...)
+	}
+	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
+}
+
+func (m *mockAuthority) Renew(cert *x509.Certificate) ([]*x509.Certificate, error) {
+	if m.renew != nil {
+		return m.renew(cert)
+	}
+	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
+}
+
+func (m *mockAuthority) RenewContext(ctx context.Context, oldcert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error) {
+	if m.renewContext != nil {
+		return m.renewContext(ctx, oldcert, pk)
+	}
+	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
+}
+
+func (m *mockAuthority) Rekey(oldcert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error) {
+	if m.rekey != nil {
+		return m.rekey(oldcert, pk)
+	}
+	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
+}
+
+func (m *mockAuthority) GetProvisioners(nextCursor string, limit int) (provisioner.List, string, error) {
+	if m.getProvisioners != nil {
+		return m.getProvisioners(nextCursor, limit)
+	}
+	return m.ret1.(provisioner.List), m.ret2.(string), m.err
+}
+
+func (m *mockAuthority) LoadProvisionerByCertificate(cert *x509.Certificate) (provisioner.Interface, error) {
+	if m.loadProvisionerByCertificate != nil {
+		return m.loadProvisionerByCertificate(cert)
+	}
+	return m.ret1.(provisioner.Interface), m.err
+}
+
+func (m *mockAuthority) LoadProvisionerByName(name string) (provisioner.Interface, error) {
+	if m.loadProvisionerByName != nil {
+		return m.loadProvisionerByName(name)
+	}
+	return m.ret1.(provisioner.Interface), m.err
+}
+
+func (m *mockAuthority) Revoke(ctx context.Context, opts *authority.RevokeOptions) error {
+	if m.revoke != nil {
+		return m.revoke(ctx, opts)
+	}
+	return m.err
+}
+
+func (m *mockAuthority) GetEncryptedKey(kid string) (string, error) {
+	if m.getEncryptedKey != nil {
+		return m.getEncryptedKey(kid)
+	}
+	return m.ret1.(string), m.err
+}
+
+func (m *mockAuthority) GetRoots() ([]*x509.Certificate, error) {
+	if m.getRoots != nil {
+		return m.getRoots()
+	}
+	return m.ret1.([]*x509.Certificate), m.err
+}
+
+func (m *mockAuthority) GetFederation() ([]*x509.Certificate, error) {
+	if m.getFederation != nil {
+		return m.getFederation()
+	}
+	return m.ret1.([]*x509.Certificate), m.err
+}
+
+func (m *mockAuthority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SignSSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+	if m.signSSH != nil {
+		return m.signSSH(ctx, key, opts, signOpts...)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
+func (m *mockAuthority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
+	if m.signSSHAddUser != nil {
+		return m.signSSHAddUser(ctx, key, cert)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
+func (m *mockAuthority) RenewSSH(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error) {
+	if m.renewSSH != nil {
+		return m.renewSSH(ctx, cert)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
+func (m *mockAuthority) RekeySSH(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
+	if m.rekeySSH != nil {
+		return m.rekeySSH(ctx, cert, key, signOpts...)
+	}
+	return m.ret1.(*ssh.Certificate), m.err
+}
+
+func (m *mockAuthority) GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]authority.Host, error) {
+	if m.getSSHHosts != nil {
+		return m.getSSHHosts(ctx, cert)
+	}
+	return m.ret1.([]authority.Host), m.err
+}
+
+func (m *mockAuthority) GetSSHRoots(ctx context.Context) (*authority.SSHKeys, error) {
+	if m.getSSHRoots != nil {
+		return m.getSSHRoots(ctx)
+	}
+	return m.ret1.(*authority.SSHKeys), m.err
+}
+
+func (m *mockAuthority) GetSSHFederation(ctx context.Context) (*authority.SSHKeys, error) {
+	if m.getSSHFederation != nil {
+		return m.getSSHFederation(ctx)
+	}
+	return m.ret1.(*authority.SSHKeys), m.err
+}
+
+func (m *mockAuthority) GetSSHConfig(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error) {
+	if m.getSSHConfig != nil {
+		return m.getSSHConfig(ctx, typ, data)
+	}
+	return m.ret1.([]templates.Output), m.err
+}
+
+func (m *mockAuthority) CheckSSHHost(ctx context.Context, principal, token string) (bool, error) {
+	if m.checkSSHHost != nil {
+		return m.checkSSHHost(ctx, principal, token)
+	}
+	return m.ret1.(bool), m.err
+}
+
+func (m *mockAuthority) GetSSHBastion(ctx context.Context, user, hostname string) (*authority.Bastion, error) {
+	if m.getSSHBastion != nil {
+		return m.getSSHBastion(ctx, user, hostname)
+	}
+	return m.ret1.(*authority.Bastion), m.err
+}
+
+func (m *mockAuthority) Version() authority.Version {
+	if m.version != nil {
+		return m.version()
+	}
+	return m.ret1.(authority.Version)
+}
+
 func TestNewCertificate(t *testing.T) {
 	cert := parseCertificate(rootPEM)
 	if !reflect.DeepEqual(Certificate{Certificate: cert}, NewCertificate(cert)) {
@@ -187,8 +424,8 @@ func TestCertificate_MarshalJSON(t *testing.T) {
 	}{
 		{"nil", fields{Certificate: nil}, []byte("null"), false},
 		{"empty", fields{Certificate: &x509.Certificate{Raw: nil}}, []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n"`), false},
-		{"root", fields{Certificate: parseCertificate(rootPEM)}, []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"`), false},
-		{"cert", fields{Certificate: parseCertificate(certPEM)}, []byte(`"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n"`), false},
+		{"root", fields{Certificate: parseCertificate(rootPEM)}, []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"`), false},
+		{"cert", fields{Certificate: parseCertificate(certPEM)}, []byte(`"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n"`), false},
 	}
 
 	for _, tt := range tests {
@@ -220,11 +457,11 @@ func TestCertificate_UnmarshalJSON(t *testing.T) {
 		{"invalid string", []byte(`"foobar"`), false, true},
 		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
 		{"empty csr", []byte(`"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"`), false, true},
-		{"invalid type", []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"`), false, true},
+		{"invalid type", []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"`), false, true},
 		{"empty string", []byte(`""`), false, false},
 		{"json null", []byte(`null`), false, false},
-		{"valid root", []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `"`), true, false},
-		{"valid cert", []byte(`"` + strings.Replace(certPEM, "\n", `\n`, -1) + `"`), true, false},
+		{"valid root", []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `"`), true, false},
+		{"valid cert", []byte(`"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `"`), true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -252,7 +489,7 @@ func TestCertificate_UnmarshalJSON_json(t *testing.T) {
 		{"empty crt (null)", `{"crt":null}`, false, false},
 		{"empty crt (string)", `{"crt":""}`, false, false},
 		{"empty crt", `{"crt":"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE----\n"}`, false, true},
-		{"valid crt", `{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `"}`, true, false},
+		{"valid crt", `{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `"}`, true, false},
 	}
 
 	type request struct {
@@ -298,7 +535,7 @@ func TestCertificateRequest_MarshalJSON(t *testing.T) {
 	}{
 		{"nil", fields{CertificateRequest: nil}, []byte("null"), false},
 		{"empty", fields{CertificateRequest: &x509.CertificateRequest{}}, []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n"`), false},
-		{"csr", fields{CertificateRequest: parseCertificateRequest(csrPEM)}, []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `\n"`), false},
+		{"csr", fields{CertificateRequest: parseCertificateRequest(csrPEM)}, []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `\n"`), false},
 	}
 
 	for _, tt := range tests {
@@ -330,10 +567,10 @@ func TestCertificateRequest_UnmarshalJSON(t *testing.T) {
 		{"invalid string", []byte(`"foobar"`), false, true},
 		{"invalid bytes 0", []byte{}, false, true}, {"invalid bytes 1", []byte{1}, false, true},
 		{"empty csr", []byte(`"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"`), false, true},
-		{"invalid type", []byte(`"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `"`), false, true},
+		{"invalid type", []byte(`"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `"`), false, true},
 		{"empty string", []byte(`""`), false, false},
 		{"json null", []byte(`null`), false, false},
-		{"valid csr", []byte(`"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"`), true, false},
+		{"valid csr", []byte(`"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"`), true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -361,7 +598,7 @@ func TestCertificateRequest_UnmarshalJSON_json(t *testing.T) {
 		{"empty csr (null)", `{"csr":null}`, false, false},
 		{"empty csr (string)", `{"csr":""}`, false, false},
 		{"empty csr", `{"csr":"-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST----\n"}`, false, true},
-		{"valid csr", `{"csr":"` + strings.Replace(csrPEM, "\n", `\n`, -1) + `"}`, true, false},
+		{"valid csr", `{"csr":"` + strings.ReplaceAll(csrPEM, "\n", `\n`) + `"}`, true, false},
 	}
 
 	type request struct {
@@ -431,6 +668,7 @@ type mockProvisioner struct {
 	ret1, ret2, ret3   interface{}
 	err                error
 	getID              func() string
+	getIDForToken      func() string
 	getTokenID         func(string) (string, error)
 	getName            func() string
 	getType            func() provisioner.Type
@@ -449,6 +687,13 @@ type mockProvisioner struct {
 func (m *mockProvisioner) GetID() string {
 	if m.getID != nil {
 		return m.getID()
+	}
+	return m.ret1.(string)
+}
+
+func (m *mockProvisioner) GetIDForToken() string {
+	if m.getIDForToken != nil {
+		return m.getIDForToken()
 	}
 	return m.ret1.(string)
 }
@@ -544,206 +789,43 @@ func (m *mockProvisioner) AuthorizeSSHRekey(ctx context.Context, token string) (
 	return m.ret1.(*ssh.Certificate), m.ret2.([]provisioner.SignOption), m.err
 }
 
-type mockAuthority struct {
-	ret1, ret2                   interface{}
-	err                          error
-	authorizeSign                func(ott string) ([]provisioner.SignOption, error)
-	getTLSOptions                func() *tlsutil.TLSOptions
-	root                         func(shasum string) (*x509.Certificate, error)
-	sign                         func(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
-	renew                        func(cert *x509.Certificate) ([]*x509.Certificate, error)
-	rekey                        func(oldCert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
-	loadProvisionerByCertificate func(cert *x509.Certificate) (provisioner.Interface, error)
-	loadProvisionerByID          func(provID string) (provisioner.Interface, error)
-	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
-	revoke                       func(context.Context, *authority.RevokeOptions) error
-	getEncryptedKey              func(kid string) (string, error)
-	getRoots                     func() ([]*x509.Certificate, error)
-	getFederation                func() ([]*x509.Certificate, error)
-	signSSH                      func(ctx context.Context, key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
-	signSSHAddUser               func(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error)
-	renewSSH                     func(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error)
-	rekeySSH                     func(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error)
-	getSSHHosts                  func(ctx context.Context, cert *x509.Certificate) ([]sshutil.Host, error)
-	getSSHRoots                  func(ctx context.Context) (*authority.SSHKeys, error)
-	getSSHFederation             func(ctx context.Context) (*authority.SSHKeys, error)
-	getSSHConfig                 func(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error)
-	checkSSHHost                 func(ctx context.Context, principal, token string) (bool, error)
-	getSSHBastion                func(ctx context.Context, user string, hostname string) (*authority.Bastion, error)
-	version                      func() authority.Version
-}
-
-// TODO: remove once Authorize is deprecated.
-func (m *mockAuthority) Authorize(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
-	return m.AuthorizeSign(ott)
-}
-
-func (m *mockAuthority) AuthorizeSign(ott string) ([]provisioner.SignOption, error) {
-	if m.authorizeSign != nil {
-		return m.authorizeSign(ott)
+func Test_CRLGeneration(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		statusCode int
+		expected   []byte
+	}{
+		{"empty", nil, http.StatusOK, nil},
 	}
-	return m.ret1.([]provisioner.SignOption), m.err
-}
 
-func (m *mockAuthority) GetTLSOptions() *tlsutil.TLSOptions {
-	if m.getTLSOptions != nil {
-		return m.getTLSOptions()
-	}
-	return m.ret1.(*tlsutil.TLSOptions)
-}
+	chiCtx := chi.NewRouteContext()
+	req := httptest.NewRequest("GET", "http://example.com/crl", nil)
+	req = req.WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, chiCtx))
 
-func (m *mockAuthority) Root(shasum string) (*x509.Certificate, error) {
-	if m.root != nil {
-		return m.root(shasum)
-	}
-	return m.ret1.(*x509.Certificate), m.err
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockMustAuthority(t, &mockAuthority{ret1: tt.expected, err: tt.err})
+			w := httptest.NewRecorder()
+			CRL(w, req)
+			res := w.Result()
 
-func (m *mockAuthority) Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
-	if m.sign != nil {
-		return m.sign(cr, opts, signOpts...)
-	}
-	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
-}
+			if res.StatusCode != tt.statusCode {
+				t.Errorf("caHandler.CRL StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
+			}
 
-func (m *mockAuthority) Renew(cert *x509.Certificate) ([]*x509.Certificate, error) {
-	if m.renew != nil {
-		return m.renew(cert)
+			body, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			if err != nil {
+				t.Errorf("caHandler.Root unexpected error = %v", err)
+			}
+			if tt.statusCode == 200 {
+				if !bytes.Equal(bytes.TrimSpace(body), tt.expected) {
+					t.Errorf("caHandler.Root CRL = %s, wants %s", body, tt.expected)
+				}
+			}
+		})
 	}
-	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
-}
-
-func (m *mockAuthority) Rekey(oldcert *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error) {
-	if m.rekey != nil {
-		return m.rekey(oldcert, pk)
-	}
-	return []*x509.Certificate{m.ret1.(*x509.Certificate), m.ret2.(*x509.Certificate)}, m.err
-}
-
-func (m *mockAuthority) GetProvisioners(nextCursor string, limit int) (provisioner.List, string, error) {
-	if m.getProvisioners != nil {
-		return m.getProvisioners(nextCursor, limit)
-	}
-	return m.ret1.(provisioner.List), m.ret2.(string), m.err
-}
-
-func (m *mockAuthority) LoadProvisionerByCertificate(cert *x509.Certificate) (provisioner.Interface, error) {
-	if m.loadProvisionerByCertificate != nil {
-		return m.loadProvisionerByCertificate(cert)
-	}
-	return m.ret1.(provisioner.Interface), m.err
-}
-
-func (m *mockAuthority) LoadProvisionerByID(provID string) (provisioner.Interface, error) {
-	if m.loadProvisionerByID != nil {
-		return m.loadProvisionerByID(provID)
-	}
-	return m.ret1.(provisioner.Interface), m.err
-}
-
-func (m *mockAuthority) Revoke(ctx context.Context, opts *authority.RevokeOptions) error {
-	if m.revoke != nil {
-		return m.revoke(ctx, opts)
-	}
-	return m.err
-}
-
-func (m *mockAuthority) GetEncryptedKey(kid string) (string, error) {
-	if m.getEncryptedKey != nil {
-		return m.getEncryptedKey(kid)
-	}
-	return m.ret1.(string), m.err
-}
-
-func (m *mockAuthority) GetRoots() ([]*x509.Certificate, error) {
-	if m.getRoots != nil {
-		return m.getRoots()
-	}
-	return m.ret1.([]*x509.Certificate), m.err
-}
-
-func (m *mockAuthority) GetFederation() ([]*x509.Certificate, error) {
-	if m.getFederation != nil {
-		return m.getFederation()
-	}
-	return m.ret1.([]*x509.Certificate), m.err
-}
-
-func (m *mockAuthority) SignSSH(ctx context.Context, key ssh.PublicKey, opts provisioner.SSHOptions, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
-	if m.signSSH != nil {
-		return m.signSSH(ctx, key, opts, signOpts...)
-	}
-	return m.ret1.(*ssh.Certificate), m.err
-}
-
-func (m *mockAuthority) SignSSHAddUser(ctx context.Context, key ssh.PublicKey, cert *ssh.Certificate) (*ssh.Certificate, error) {
-	if m.signSSHAddUser != nil {
-		return m.signSSHAddUser(ctx, key, cert)
-	}
-	return m.ret1.(*ssh.Certificate), m.err
-}
-
-func (m *mockAuthority) RenewSSH(ctx context.Context, cert *ssh.Certificate) (*ssh.Certificate, error) {
-	if m.renewSSH != nil {
-		return m.renewSSH(ctx, cert)
-	}
-	return m.ret1.(*ssh.Certificate), m.err
-}
-
-func (m *mockAuthority) RekeySSH(ctx context.Context, cert *ssh.Certificate, key ssh.PublicKey, signOpts ...provisioner.SignOption) (*ssh.Certificate, error) {
-	if m.rekeySSH != nil {
-		return m.rekeySSH(ctx, cert, key, signOpts...)
-	}
-	return m.ret1.(*ssh.Certificate), m.err
-}
-
-func (m *mockAuthority) GetSSHHosts(ctx context.Context, cert *x509.Certificate) ([]sshutil.Host, error) {
-	if m.getSSHHosts != nil {
-		return m.getSSHHosts(ctx, cert)
-	}
-	return m.ret1.([]sshutil.Host), m.err
-}
-
-func (m *mockAuthority) GetSSHRoots(ctx context.Context) (*authority.SSHKeys, error) {
-	if m.getSSHRoots != nil {
-		return m.getSSHRoots(ctx)
-	}
-	return m.ret1.(*authority.SSHKeys), m.err
-}
-
-func (m *mockAuthority) GetSSHFederation(ctx context.Context) (*authority.SSHKeys, error) {
-	if m.getSSHFederation != nil {
-		return m.getSSHFederation(ctx)
-	}
-	return m.ret1.(*authority.SSHKeys), m.err
-}
-
-func (m *mockAuthority) GetSSHConfig(ctx context.Context, typ string, data map[string]string) ([]templates.Output, error) {
-	if m.getSSHConfig != nil {
-		return m.getSSHConfig(ctx, typ, data)
-	}
-	return m.ret1.([]templates.Output), m.err
-}
-
-func (m *mockAuthority) CheckSSHHost(ctx context.Context, principal, token string) (bool, error) {
-	if m.checkSSHHost != nil {
-		return m.checkSSHHost(ctx, principal, token)
-	}
-	return m.ret1.(bool), m.err
-}
-
-func (m *mockAuthority) GetSSHBastion(ctx context.Context, user string, hostname string) (*authority.Bastion, error) {
-	if m.getSSHBastion != nil {
-		return m.getSSHBastion(ctx, user, hostname)
-	}
-	return m.ret1.(*authority.Bastion), m.err
-}
-
-func (m *mockAuthority) Version() authority.Version {
-	if m.version != nil {
-		return m.version()
-	}
-	return m.ret1.(authority.Version)
 }
 
 func Test_caHandler_Route(t *testing.T) {
@@ -770,18 +852,17 @@ func Test_caHandler_Route(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Health(t *testing.T) {
+func Test_Health(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/health", nil)
 	w := httptest.NewRecorder()
-	h := New(&mockAuthority{}).(*caHandler)
-	h.Health(w, req)
+	Health(w, req)
 
 	res := w.Result()
 	if res.StatusCode != 200 {
 		t.Errorf("caHandler.Health StatusCode = %d, wants 200", res.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
 		t.Errorf("caHandler.Health unexpected error = %v", err)
@@ -792,7 +873,7 @@ func Test_caHandler_Health(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Root(t *testing.T) {
+func Test_Root(t *testing.T) {
 	tests := []struct {
 		name       string
 		root       *x509.Certificate
@@ -809,20 +890,20 @@ func Test_caHandler_Root(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://example.com/root/efc7d6b475a56fe587650bcdb999a4a308f815ba44db4bf0371ea68a786ccd36", nil)
 	req = req.WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, chiCtx))
 
-	expected := []byte(`{"ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"}`)
+	expected := []byte(`{"ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{ret1: tt.root, err: tt.err}).(*caHandler)
+			mockMustAuthority(t, &mockAuthority{ret1: tt.root, err: tt.err})
 			w := httptest.NewRecorder()
-			h.Root(w, req)
+			Root(w, req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Root StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Root unexpected error = %v", err)
@@ -836,7 +917,7 @@ func Test_caHandler_Root(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Sign(t *testing.T) {
+func Test_Sign(t *testing.T) {
 	csr := parseCertificateRequest(csrPEM)
 	valid, err := json.Marshal(SignRequest{
 		CsrPEM: CertificateRequest{csr},
@@ -853,8 +934,8 @@ func Test_caHandler_Sign(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expected1 := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
-	expected2 := []byte(`{"crt":"` + strings.Replace(stepCertPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(stepCertPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected1 := []byte(`{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
+	expected2 := []byte(`{"crt":"` + strings.ReplaceAll(stepCertPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(stepCertPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	tests := []struct {
 		name         string
@@ -877,25 +958,25 @@ func Test_caHandler_Sign(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
+			mockMustAuthority(t, &mockAuthority{
 				ret1: tt.cert, ret2: tt.root, err: tt.signErr,
-				authorizeSign: func(ott string) ([]provisioner.SignOption, error) {
+				authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
 					return tt.certAttrOpts, tt.autherr
 				},
-				getTLSOptions: func() *tlsutil.TLSOptions {
+				getTLSOptions: func() *authority.TLSOptions {
 					return nil
 				},
-			}).(*caHandler)
+			})
 			req := httptest.NewRequest("POST", "http://example.com/sign", strings.NewReader(tt.input))
 			w := httptest.NewRecorder()
-			h.Sign(logging.NewResponseLogger(w), req)
+			Sign(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Root StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Root unexpected error = %v", err)
@@ -909,59 +990,152 @@ func Test_caHandler_Sign(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Renew(t *testing.T) {
+func Test_Renew(t *testing.T) {
 	cs := &tls.ConnectionState{
 		PeerCertificates: []*x509.Certificate{parseCertificate(certPEM)},
 	}
+
+	// Prepare root and leaf for renew after expiry test.
+	now := time.Now()
+	rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafPub, leafPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := &x509.Certificate{
+		Subject:               pkix.Name{CommonName: "Test Root CA"},
+		PublicKey:             rootPub,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		NotBefore:             now.Add(-2 * time.Hour),
+		NotAfter:              now.Add(time.Hour),
+	}
+	root, err = x509util.CreateCertificate(root, root, rootPub, rootPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredLeaf := &x509.Certificate{
+		Subject:        pkix.Name{CommonName: "Leaf certificate"},
+		PublicKey:      leafPub,
+		KeyUsage:       x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		NotBefore:      now.Add(-time.Hour),
+		NotAfter:       now.Add(-time.Minute),
+		EmailAddresses: []string{"test@example.org"},
+	}
+	expiredLeaf, err = x509util.CreateCertificate(expiredLeaf, root, leafPub, rootPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate renew after expiry token
+	so := new(jose.SignerOptions)
+	so.WithType("JWT")
+	so.WithHeader("x5cInsecure", []string{base64.StdEncoding.EncodeToString(expiredLeaf.Raw)})
+	sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: leafPriv}, so)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generateX5cToken := func(claims jose.Claims) string {
+		s, err := jose.Signed(sig).Claims(claims).CompactSerialize()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
 	tests := []struct {
 		name       string
 		tls        *tls.ConnectionState
+		header     http.Header
 		cert       *x509.Certificate
 		root       *x509.Certificate
 		err        error
 		statusCode int
 	}{
-		{"ok", cs, parseCertificate(certPEM), parseCertificate(rootPEM), nil, http.StatusCreated},
-		{"no tls", nil, nil, nil, nil, http.StatusBadRequest},
-		{"no peer certificates", &tls.ConnectionState{}, nil, nil, nil, http.StatusBadRequest},
-		{"renew error", cs, nil, nil, errs.Forbidden("an error"), http.StatusForbidden},
+		{"ok", cs, nil, parseCertificate(certPEM), parseCertificate(rootPEM), nil, http.StatusCreated},
+		{"ok renew after expiry", &tls.ConnectionState{}, http.Header{
+			"Authorization": []string{"Bearer " + generateX5cToken(jose.Claims{
+				NotBefore: jose.NewNumericDate(now), Expiry: jose.NewNumericDate(now.Add(5 * time.Minute)),
+			})},
+		}, expiredLeaf, root, nil, http.StatusCreated},
+		{"no tls", nil, nil, nil, nil, nil, http.StatusBadRequest},
+		{"no peer certificates", &tls.ConnectionState{}, nil, nil, nil, nil, http.StatusBadRequest},
+		{"renew error", cs, nil, nil, nil, errs.Forbidden("an error"), http.StatusForbidden},
+		{"fail expired token", &tls.ConnectionState{}, http.Header{
+			"Authorization": []string{"Bearer " + generateX5cToken(jose.Claims{
+				NotBefore: jose.NewNumericDate(now.Add(-time.Hour)), Expiry: jose.NewNumericDate(now.Add(-time.Minute)),
+			})},
+		}, expiredLeaf, root, errs.Forbidden("an error"), http.StatusUnauthorized},
+		{"fail invalid root", &tls.ConnectionState{}, http.Header{
+			"Authorization": []string{"Bearer " + generateX5cToken(jose.Claims{
+				NotBefore: jose.NewNumericDate(now.Add(-time.Hour)), Expiry: jose.NewNumericDate(now.Add(-time.Minute)),
+			})},
+		}, expiredLeaf, parseCertificate(rootPEM), errs.Forbidden("an error"), http.StatusUnauthorized},
 	}
-
-	expected := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
+			mockMustAuthority(t, &mockAuthority{
 				ret1: tt.cert, ret2: tt.root, err: tt.err,
-				getTLSOptions: func() *tlsutil.TLSOptions {
+				authorizeRenewToken: func(ctx context.Context, ott string) (*x509.Certificate, error) {
+					jwt, chain, err := jose.ParseX5cInsecure(ott, []*x509.Certificate{tt.root})
+					if err != nil {
+						return nil, errs.Unauthorized(err.Error())
+					}
+					var claims jose.Claims
+					if err := jwt.Claims(chain[0][0].PublicKey, &claims); err != nil {
+						return nil, errs.Unauthorized(err.Error())
+					}
+					if err := claims.ValidateWithLeeway(jose.Expected{
+						Time: now,
+					}, time.Minute); err != nil {
+						return nil, errs.Unauthorized(err.Error())
+					}
+					return chain[0][0], nil
+				},
+				getTLSOptions: func() *authority.TLSOptions {
 					return nil
 				},
-			}).(*caHandler)
+			})
 			req := httptest.NewRequest("POST", "http://example.com/renew", nil)
 			req.TLS = tt.tls
+			req.Header = tt.header
 			w := httptest.NewRecorder()
-			h.Renew(logging.NewResponseLogger(w), req)
+			Renew(logging.NewResponseLogger(w), req)
+
 			res := w.Result()
+			defer res.Body.Close()
 
-			if res.StatusCode != tt.statusCode {
-				t.Errorf("caHandler.Renew StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
-			}
-
-			body, err := ioutil.ReadAll(res.Body)
-			res.Body.Close()
+			body, err := io.ReadAll(res.Body)
 			if err != nil {
 				t.Errorf("caHandler.Renew unexpected error = %v", err)
 			}
+			if res.StatusCode != tt.statusCode {
+				t.Errorf("caHandler.Renew StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
+				t.Errorf("%s", body)
+			}
+
 			if tt.statusCode < http.StatusBadRequest {
+				expected := []byte(`{"crt":"` + strings.ReplaceAll(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tt.cert.Raw})), "\n", `\n`) + `",` +
+					`"ca":"` + strings.ReplaceAll(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tt.root.Raw})), "\n", `\n`) + `",` +
+					`"certChain":["` +
+					strings.ReplaceAll(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tt.cert.Raw})), "\n", `\n`) + `","` +
+					strings.ReplaceAll(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tt.root.Raw})), "\n", `\n`) + `"]}`)
+
 				if !bytes.Equal(bytes.TrimSpace(body), expected) {
-					t.Errorf("caHandler.Root Body = %s, wants %s", body, expected)
+					t.Errorf("caHandler.Root Body = \n%s, wants \n%s", body, expected)
 				}
 			}
 		})
 	}
 }
 
-func Test_caHandler_Rekey(t *testing.T) {
+func Test_Rekey(t *testing.T) {
 	cs := &tls.ConnectionState{
 		PeerCertificates: []*x509.Certificate{parseCertificate(certPEM)},
 	}
@@ -988,27 +1162,27 @@ func Test_caHandler_Rekey(t *testing.T) {
 		{"json read error", "{", cs, nil, nil, nil, http.StatusBadRequest},
 	}
 
-	expected := []byte(`{"crt":"` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","ca":"` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n","certChain":["` + strings.Replace(certPEM, "\n", `\n`, -1) + `\n","` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crt":"` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","ca":"` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n","certChain":["` + strings.ReplaceAll(certPEM, "\n", `\n`) + `\n","` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{
+			mockMustAuthority(t, &mockAuthority{
 				ret1: tt.cert, ret2: tt.root, err: tt.err,
-				getTLSOptions: func() *tlsutil.TLSOptions {
+				getTLSOptions: func() *authority.TLSOptions {
 					return nil
 				},
-			}).(*caHandler)
+			})
 			req := httptest.NewRequest("POST", "http://example.com/rekey", strings.NewReader(tt.input))
 			req.TLS = tt.tls
 			w := httptest.NewRecorder()
-			h.Rekey(logging.NewResponseLogger(w), req)
+			Rekey(logging.NewResponseLogger(w), req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Rekey StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Rekey unexpected error = %v", err)
@@ -1022,7 +1196,7 @@ func Test_caHandler_Rekey(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Provisioners(t *testing.T) {
+func Test_Provisioners(t *testing.T) {
 	type fields struct {
 		Authority Authority
 	}
@@ -1031,12 +1205,12 @@ func Test_caHandler_Provisioners(t *testing.T) {
 		r *http.Request
 	}
 
-	req, err := http.NewRequest("GET", "http://example.com/provisioners?cursor=foo&limit=20", nil)
+	req, err := http.NewRequest("GET", "http://example.com/provisioners?cursor=foo&limit=20", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	reqLimitFail, err := http.NewRequest("GET", "http://example.com/provisioners?limit=abc", nil)
+	reqLimitFail, err := http.NewRequest("GET", "http://example.com/provisioners?limit=abc", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1080,7 +1254,7 @@ func Test_caHandler_Provisioners(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedError400 := errs.BadRequest("force")
+	expectedError400 := errs.BadRequest("limit 'abc' is not an integer")
 	expectedError400Bytes, err := json.Marshal(expectedError400)
 	assert.FatalError(t, err)
 	expectedError500 := errs.InternalServer("force")
@@ -1088,17 +1262,15 @@ func Test_caHandler_Provisioners(t *testing.T) {
 	assert.FatalError(t, err)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := &caHandler{
-				Authority: tt.fields.Authority,
-			}
-			h.Provisioners(tt.args.w, tt.args.r)
+			mockMustAuthority(t, tt.fields.Authority)
+			Provisioners(tt.args.w, tt.args.r)
 
 			rec := tt.args.w.(*httptest.ResponseRecorder)
 			res := rec.Result()
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Provisioners StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Provisioners unexpected error = %v", err)
@@ -1126,7 +1298,7 @@ func Test_caHandler_Provisioners(t *testing.T) {
 	}
 }
 
-func Test_caHandler_ProvisionerKey(t *testing.T) {
+func Test_ProvisionerKey(t *testing.T) {
 	type fields struct {
 		Authority Authority
 	}
@@ -1158,17 +1330,15 @@ func Test_caHandler_ProvisionerKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := &caHandler{
-				Authority: tt.fields.Authority,
-			}
-			h.ProvisionerKey(tt.args.w, tt.args.r)
+			mockMustAuthority(t, tt.fields.Authority)
+			ProvisionerKey(tt.args.w, tt.args.r)
 
 			rec := tt.args.w.(*httptest.ResponseRecorder)
 			res := rec.Result()
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Provisioners StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Provisioners unexpected error = %v", err)
@@ -1186,7 +1356,7 @@ func Test_caHandler_ProvisionerKey(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Roots(t *testing.T) {
+func Test_Roots(t *testing.T) {
 	cs := &tls.ConnectionState{
 		PeerCertificates: []*x509.Certificate{parseCertificate(certPEM)},
 	}
@@ -1203,22 +1373,22 @@ func Test_caHandler_Roots(t *testing.T) {
 		{"fail", cs, nil, nil, fmt.Errorf("an error"), http.StatusForbidden},
 	}
 
-	expected := []byte(`{"crts":["` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crts":["` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{ret1: []*x509.Certificate{tt.root}, err: tt.err}).(*caHandler)
+			mockMustAuthority(t, &mockAuthority{ret1: []*x509.Certificate{tt.root}, err: tt.err})
 			req := httptest.NewRequest("GET", "http://example.com/roots", nil)
 			req.TLS = tt.tls
 			w := httptest.NewRecorder()
-			h.Roots(w, req)
+			Roots(w, req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Roots StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Roots unexpected error = %v", err)
@@ -1232,7 +1402,47 @@ func Test_caHandler_Roots(t *testing.T) {
 	}
 }
 
-func Test_caHandler_Federation(t *testing.T) {
+func Test_caHandler_RootsPEM(t *testing.T) {
+	parsedRoot := parseCertificate(rootPEM)
+	tests := []struct {
+		name       string
+		roots      []*x509.Certificate
+		err        error
+		statusCode int
+		expect     string
+	}{
+		{"one root", []*x509.Certificate{parsedRoot}, nil, http.StatusOK, rootPEM},
+		{"two roots", []*x509.Certificate{parsedRoot, parsedRoot}, nil, http.StatusOK, rootPEM + "\n" + rootPEM},
+		{"fail", nil, errors.New("an error"), http.StatusInternalServerError, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockMustAuthority(t, &mockAuthority{ret1: tt.roots, err: tt.err})
+			req := httptest.NewRequest("GET", "https://example.com/roots", nil)
+			w := httptest.NewRecorder()
+			RootsPEM(w, req)
+			res := w.Result()
+
+			if res.StatusCode != tt.statusCode {
+				t.Errorf("caHandler.RootsPEM StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
+			}
+
+			body, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			if err != nil {
+				t.Errorf("caHandler.RootsPEM unexpected error = %v", err)
+			}
+			if tt.statusCode < http.StatusBadRequest {
+				if !bytes.Equal(bytes.TrimSpace(body), []byte(tt.expect)) {
+					t.Errorf("caHandler.RootsPEM Body = %s, wants %s", body, tt.expect)
+				}
+			}
+		})
+	}
+}
+
+func Test_Federation(t *testing.T) {
 	cs := &tls.ConnectionState{
 		PeerCertificates: []*x509.Certificate{parseCertificate(certPEM)},
 	}
@@ -1249,22 +1459,22 @@ func Test_caHandler_Federation(t *testing.T) {
 		{"fail", cs, nil, nil, fmt.Errorf("an error"), http.StatusForbidden},
 	}
 
-	expected := []byte(`{"crts":["` + strings.Replace(rootPEM, "\n", `\n`, -1) + `\n"]}`)
+	expected := []byte(`{"crts":["` + strings.ReplaceAll(rootPEM, "\n", `\n`) + `\n"]}`)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New(&mockAuthority{ret1: []*x509.Certificate{tt.root}, err: tt.err}).(*caHandler)
+			mockMustAuthority(t, &mockAuthority{ret1: []*x509.Certificate{tt.root}, err: tt.err})
 			req := httptest.NewRequest("GET", "http://example.com/federation", nil)
 			req.TLS = tt.tls
 			w := httptest.NewRecorder()
-			h.Federation(w, req)
+			Federation(w, req)
 			res := w.Result()
 
 			if res.StatusCode != tt.statusCode {
 				t.Errorf("caHandler.Federation StatusCode = %d, wants %d", res.StatusCode, tt.statusCode)
 			}
 
-			body, err := ioutil.ReadAll(res.Body)
+			body, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Errorf("caHandler.Federation unexpected error = %v", err)
@@ -1283,7 +1493,11 @@ func Test_fmtPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rsa1024, err := rsa.GenerateKey(rand.Reader, 1024)
+	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1305,7 +1519,8 @@ func Test_fmtPublicKey(t *testing.T) {
 		want string
 	}{
 		{"p256", args{p256.Public(), p256, nil}, "ECDSA P-256"},
-		{"rsa1024", args{rsa1024.Public(), rsa1024, nil}, "RSA 1024"},
+		{"rsa2048", args{rsa2048.Public(), rsa2048, nil}, "RSA 2048"},
+		{"ed25519", args{edPub, edPriv, nil}, "Ed25519"},
 		{"dsa2048", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.DSA, PublicKey: &dsa2048.PublicKey}}, "DSA 2048"},
 		{"unknown", args{cert: &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: []byte("12345678")}}, "ECDSA unknown"},
 	}

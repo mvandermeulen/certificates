@@ -20,7 +20,7 @@ type SimpleDB struct {
 	usedTokens *sync.Map
 }
 
-func newSimpleDB(c *Config) (AuthDB, error) {
+func newSimpleDB(c *Config) (*SimpleDB, error) {
 	db := &SimpleDB{}
 	db.usedTokens = new(sync.Map)
 	return db, nil
@@ -41,9 +41,29 @@ func (s *SimpleDB) Revoke(rci *RevokedCertificateInfo) error {
 	return ErrNotImplemented
 }
 
+// GetRevokedCertificates returns a "NotImplemented" error.
+func (s *SimpleDB) GetRevokedCertificates() (*[]RevokedCertificateInfo, error) {
+	return nil, ErrNotImplemented
+}
+
+// GetCRL returns a "NotImplemented" error.
+func (s *SimpleDB) GetCRL() (*CertificateRevocationListInfo, error) {
+	return nil, ErrNotImplemented
+}
+
+// StoreCRL returns a "NotImplemented" error.
+func (s *SimpleDB) StoreCRL(crlInfo *CertificateRevocationListInfo) error {
+	return ErrNotImplemented
+}
+
 // RevokeSSH returns a "NotImplemented" error.
 func (s *SimpleDB) RevokeSSH(rci *RevokedCertificateInfo) error {
 	return ErrNotImplemented
+}
+
+// GetCertificate returns a "NotImplemented" error.
+func (s *SimpleDB) GetCertificate(serialNumber string) (*x509.Certificate, error) {
+	return nil, ErrNotImplemented
 }
 
 // StoreCertificate returns a "NotImplemented" error.

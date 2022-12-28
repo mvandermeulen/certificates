@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,10 +18,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"go.step.sm/crypto/jose"
+
 	"github.com/smallstep/assert"
-	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"github.com/smallstep/certificates/api/render"
 )
 
 func TestAWS_Getters(t *testing.T) {
@@ -141,6 +142,12 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 	p7.config.signatureURL = p1.config.signatureURL
 	p7.config.tokenURL = p1.config.tokenURL
 
+	p8, err := generateAWS()
+	assert.FatalError(t, err)
+	p8.IMDSVersions = nil
+	p8.Accounts = p1.Accounts
+	p8.config = p1.config
+
 	caURL := "https://ca.smallstep.com"
 	u, err := url.Parse(caURL)
 	assert.FatalError(t, err)
@@ -156,6 +163,7 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 		wantErr bool
 	}{
 		{"ok", p1, args{"foo.local", caURL}, false},
+		{"ok no imds", p8, args{"foo.local", caURL}, false},
 		{"fail ca url", p1, args{"foo.local", "://ca.smallstep.com"}, true},
 		{"fail identityURL", p2, args{"foo.local", caURL}, true},
 		{"fail signatureURL", p3, args{"foo.local", caURL}, true},
@@ -178,8 +186,12 @@ func TestAWS_GetIdentityToken(t *testing.T) {
 					assert.Equals(t, tt.args.subject, c.Subject)
 					assert.Equals(t, jose.Audience{u.ResolveReference(&url.URL{Path: "/1.0/sign", Fragment: tt.aws.GetID()}).String()}, c.Audience)
 					assert.Equals(t, tt.aws.Accounts[0], c.document.AccountID)
-					err = tt.aws.config.certificate.CheckSignature(
-						tt.aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+					for _, crt := range tt.aws.config.certificates {
+						err = crt.CheckSignature(tt.aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+						if err == nil {
+							break
+						}
+					}
 					assert.NoError(t, err)
 				}
 			}
@@ -206,8 +218,12 @@ func TestAWS_GetIdentityToken_V1Only(t *testing.T) {
 		assert.Equals(t, subject, c.Subject)
 		assert.Equals(t, jose.Audience{u.ResolveReference(&url.URL{Path: "/1.0/sign", Fragment: aws.GetID()}).String()}, c.Audience)
 		assert.Equals(t, aws.Accounts[0], c.document.AccountID)
-		err = aws.config.certificate.CheckSignature(
-			aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+		for _, crt := range aws.config.certificates {
+			err = crt.CheckSignature(aws.config.signatureAlgorithm, c.Amazon.Document, c.Amazon.Signature)
+			if err == nil {
+				break
+			}
+		}
 		assert.NoError(t, err)
 	}
 }
@@ -247,6 +263,7 @@ func TestAWS_Init(t *testing.T) {
 		DisableTrustOnFirstUse bool
 		InstanceAge            Duration
 		IMDSVersions           []string
+		IIDRoots               string
 		Claims                 *Claims
 	}
 	type args struct {
@@ -258,16 +275,19 @@ func TestAWS_Init(t *testing.T) {
 		args    args
 		wantErr bool
 	}{
-		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, false},
-		{"ok/v1", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1"}, nil}, args{config}, false},
-		{"ok/v2", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v2"}, nil}, args{config}, false},
-		{"ok/empty", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{}, nil}, args{config}, false},
-		{"ok/duration", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, []string{"v1", "v2"}, nil}, args{config}, false},
-		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, true},
-		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, []string{"v1", "v2"}, nil}, args{config}, true},
-		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, []string{"v1", "v2"}, nil}, args{config}, true},
-		{"fail/imds", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, nil}, args{config}, true},
-		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, badClaims}, args{config}, true},
+		{"ok", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, false},
+		{"ok/v1", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1"}, "", nil}, args{config}, false},
+		{"ok/v2", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v2"}, "", nil}, args{config}, false},
+		{"ok/empty", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{}, "", nil}, args{config}, false},
+		{"ok/duration", fields{"AWS", "name", []string{"account"}, true, true, Duration{Duration: 1 * time.Minute}, []string{"v1", "v2"}, "", nil}, args{config}, false},
+		{"ok/cert", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "testdata/certs/aws.crt", nil}, args{config}, false},
+		{"fail type ", fields{"", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"fail name", fields{"AWS", "", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"bad instance age", fields{"AWS", "name", []string{"account"}, false, false, Duration{Duration: -1 * time.Minute}, []string{"v1", "v2"}, "", nil}, args{config}, true},
+		{"fail/imds", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "", nil}, args{config}, true},
+		{"fail/missing", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "testdata/missing.crt", nil}, args{config}, true},
+		{"fail/cert", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"bad"}, "testdata/certs/rsa.csr", nil}, args{config}, true},
+		{"fail claims", fields{"AWS", "name", []string{"account"}, false, false, zero, []string{"v1", "v2"}, "", badClaims}, args{config}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -279,6 +299,7 @@ func TestAWS_Init(t *testing.T) {
 				DisableTrustOnFirstUse: tt.fields.DisableTrustOnFirstUse,
 				InstanceAge:            tt.fields.InstanceAge,
 				IMDSVersions:           tt.fields.IMDSVersions,
+				IIDRoots:               tt.fields.IIDRoots,
 				Claims:                 tt.fields.Claims,
 			}
 			if err := p.Init(tt.args.config); (err != nil) != tt.wantErr {
@@ -295,7 +316,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 	}
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	assert.FatalError(t, err)
-	badKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	badKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	assert.FatalError(t, err)
 
 	type test struct {
@@ -319,7 +340,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), badKey)
 			assert.FatalError(t, err)
 			return test{
@@ -333,7 +354,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), "", "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), "", "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -347,7 +368,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -361,7 +382,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -375,7 +396,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -389,7 +410,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", "bad-issuer", p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", "bad-issuer", p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -403,7 +424,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, "bad-audience", p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, "bad-audience", p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -418,7 +439,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			assert.FatalError(t, err)
 			p.DisableCustomSANs = true
 			tok, err := generateAWSToken(
-				"foo", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "foo", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -432,7 +453,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), "foo", "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), "foo", "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -447,7 +468,7 @@ func TestAWS_authorizeToken(t *testing.T) {
 			assert.FatalError(t, err)
 			p.InstanceAge = Duration{1 * time.Minute}
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now().Add(-1*time.Minute), key)
 			assert.FatalError(t, err)
 			return test{
@@ -461,7 +482,33 @@ func TestAWS_authorizeToken(t *testing.T) {
 			p, err := generateAWS()
 			assert.FatalError(t, err)
 			tok, err := generateAWSToken(
-				"instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				"127.0.0.1", "us-west-1", time.Now(), key)
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: tok,
+			}
+		},
+		"ok/identityCert": func(t *testing.T) test {
+			p, err := generateAWS()
+			p.IIDRoots = "testdata/certs/aws-test.crt"
+			assert.FatalError(t, err)
+			tok, err := generateAWSToken(
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
+				"127.0.0.1", "us-west-1", time.Now(), key)
+			assert.FatalError(t, err)
+			return test{
+				p:     p,
+				token: tok,
+			}
+		},
+		"ok/identityCert2": func(t *testing.T) test {
+			p, err := generateAWS()
+			p.IIDRoots = "testdata/certs/aws.crt"
+			assert.FatalError(t, err)
+			tok, err := generateAWSToken(
+				p, "instance-id", awsIssuer, p.GetID(), p.Accounts[0], "instance-id",
 				"127.0.0.1", "us-west-1", time.Now(), key)
 			assert.FatalError(t, err)
 			return test{
@@ -475,8 +522,8 @@ func TestAWS_authorizeToken(t *testing.T) {
 			tc := tt(t)
 			if claims, err := tc.p.authorizeToken(tc.token); err != nil {
 				if assert.NotNil(t, tc.err) {
-					sc, ok := err.(errs.StatusCoder)
-					assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+					var sc render.StatusCodedError
+					assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 					assert.Equals(t, sc.StatusCode(), tc.code)
 					assert.HasPrefix(t, err.Error(), tc.err.Error())
 				}
@@ -532,55 +579,55 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	assert.FatalError(t, err)
 
-	badKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	badKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	assert.FatalError(t, err)
 
 	t4, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failSubject, err := generateAWSToken(
-		"bad-subject", awsIssuer, p2.GetID(), p2.Accounts[0], "instance-id",
+		p2, "bad-subject", awsIssuer, p2.GetID(), p2.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failIssuer, err := generateAWSToken(
-		"instance-id", "bad-issuer", p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", "bad-issuer", p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failAudience, err := generateAWSToken(
-		"instance-id", awsIssuer, "bad-audience", p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, "bad-audience", p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failAccount, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), "", "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), "", "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failInstanceID, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "",
 		"127.0.0.1", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failPrivateIP, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"", "us-west-1", time.Now(), key)
 	assert.FatalError(t, err)
 	failRegion, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "", time.Now(), key)
 	assert.FatalError(t, err)
 	failExp, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now().Add(-360*time.Second), key)
 	assert.FatalError(t, err)
 	failNbf, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now().Add(360*time.Second), key)
 	assert.FatalError(t, err)
 	failKey, err := generateAWSToken(
-		"instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
+		p1, "instance-id", awsIssuer, p1.GetID(), p1.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now(), badKey)
 	assert.FatalError(t, err)
 	failInstanceAge, err := generateAWSToken(
-		"instance-id", awsIssuer, p2.GetID(), p2.Accounts[0], "instance-id",
+		p2, "instance-id", awsIssuer, p2.GetID(), p2.Accounts[0], "instance-id",
 		"127.0.0.1", "us-west-1", time.Now().Add(-1*time.Minute), key)
 	assert.FatalError(t, err)
 
@@ -595,11 +642,11 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 		code    int
 		wantErr bool
 	}{
-		{"ok", p1, args{t1, "foo.local"}, 5, http.StatusOK, false},
-		{"ok", p2, args{t2, "instance-id"}, 9, http.StatusOK, false},
-		{"ok", p2, args{t2Hostname, "ip-127-0-0-1.us-west-1.compute.internal"}, 9, http.StatusOK, false},
-		{"ok", p2, args{t2PrivateIP, "127.0.0.1"}, 9, http.StatusOK, false},
-		{"ok", p1, args{t4, "instance-id"}, 5, http.StatusOK, false},
+		{"ok", p1, args{t1, "foo.local"}, 9, http.StatusOK, false},
+		{"ok", p2, args{t2, "instance-id"}, 13, http.StatusOK, false},
+		{"ok", p2, args{t2Hostname, "ip-127-0-0-1.us-west-1.compute.internal"}, 13, http.StatusOK, false},
+		{"ok", p2, args{t2PrivateIP, "127.0.0.1"}, 13, http.StatusOK, false},
+		{"ok", p1, args{t4, "instance-id"}, 9, http.StatusOK, false},
 		{"fail account", p3, args{token: t3}, 0, http.StatusUnauthorized, true},
 		{"fail token", p1, args{token: "token"}, 0, http.StatusUnauthorized, true},
 		{"fail subject", p1, args{token: failSubject}, 0, http.StatusUnauthorized, true},
@@ -617,31 +664,33 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := NewContextWithMethod(context.Background(), SignMethod)
-			got, err := tt.aws.AuthorizeSign(ctx, tt.args.token)
-			if (err != nil) != tt.wantErr {
+			switch got, err := tt.aws.AuthorizeSign(ctx, tt.args.token); {
+			case (err != nil) != tt.wantErr:
 				t.Errorf("AWS.AuthorizeSign() error = %v, wantErr %v", err, tt.wantErr)
 				return
-			} else if err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+			case err != nil:
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
-			} else {
-				assert.Len(t, tt.wantLen, got)
+			default:
+				assert.Equals(t, tt.wantLen, len(got))
 				for _, o := range got {
 					switch v := o.(type) {
+					case *AWS:
+					case certificateOptionsFunc:
 					case *provisionerExtensionOption:
-						assert.Equals(t, v.Type, int(TypeAWS))
+						assert.Equals(t, v.Type, TypeAWS)
 						assert.Equals(t, v.Name, tt.aws.GetName())
 						assert.Equals(t, v.CredentialID, tt.aws.Accounts[0])
 						assert.Len(t, 2, v.KeyValuePairs)
 					case profileDefaultDuration:
-						assert.Equals(t, time.Duration(v), tt.aws.claimer.DefaultTLSCertDuration())
+						assert.Equals(t, time.Duration(v), tt.aws.ctl.Claimer.DefaultTLSCertDuration())
 					case commonNameValidator:
 						assert.Equals(t, string(v), tt.args.cn)
 					case defaultPublicKeyValidator:
 					case *validityValidator:
-						assert.Equals(t, v.min, tt.aws.claimer.MinTLSCertDuration())
-						assert.Equals(t, v.max, tt.aws.claimer.MaxTLSCertDuration())
+						assert.Equals(t, v.min, tt.aws.ctl.Claimer.MinTLSCertDuration())
+						assert.Equals(t, v.max, tt.aws.ctl.Claimer.MaxTLSCertDuration())
 					case ipAddressesValidator:
 						assert.Equals(t, []net.IP(v), []net.IP{net.ParseIP("127.0.0.1")})
 					case emailAddressesValidator:
@@ -650,8 +699,12 @@ func TestAWS_AuthorizeSign(t *testing.T) {
 						assert.Equals(t, v, nil)
 					case dnsNamesValidator:
 						assert.Equals(t, []string(v), []string{"ip-127-0-0-1.us-west-1.compute.internal"})
+					case *x509NamePolicyValidator:
+						assert.Equals(t, nil, v.policyEngine)
+					case *WebhookController:
+						assert.Len(t, 0, v.webhooks)
 					default:
-						assert.FatalError(t, errors.Errorf("unexpected sign option of type %T", v))
+						assert.FatalError(t, fmt.Errorf("unexpected sign option of type %T", v))
 					}
 				}
 			}
@@ -679,7 +732,7 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 	// disable sshCA
 	disable := false
 	p3.Claims = &Claims{EnableSSHCA: &disable}
-	p3.claimer, err = NewClaimer(p3.Claims, globalProvisionerClaims)
+	p3.ctl.Claimer, err = NewClaimer(p3.Claims, globalProvisionerClaims)
 	assert.FatalError(t, err)
 
 	t1, err := p1.GetIdentityToken("127.0.0.1", "https://ca.smallstep.com")
@@ -697,55 +750,56 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 	pub := key.Public().Key
 	rsa2048, err := rsa.GenerateKey(rand.Reader, 2048)
 	assert.FatalError(t, err)
+	//nolint:gosec // tests minimum size of the key
 	rsa1024, err := rsa.GenerateKey(rand.Reader, 1024)
 	assert.FatalError(t, err)
 
-	hostDuration := p1.claimer.DefaultHostSSHCertDuration()
-	expectedHostOptions := &SSHOptions{
+	hostDuration := p1.ctl.Claimer.DefaultHostSSHCertDuration()
+	expectedHostOptions := &SignSSHOptions{
 		CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedHostOptionsIP := &SSHOptions{
+	expectedHostOptionsIP := &SignSSHOptions{
 		CertType: "host", Principals: []string{"127.0.0.1"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedHostOptionsHostname := &SSHOptions{
+	expectedHostOptionsHostname := &SignSSHOptions{
 		CertType: "host", Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
-	expectedCustomOptions := &SSHOptions{
+	expectedCustomOptions := &SignSSHOptions{
 		CertType: "host", Principals: []string{"foo.local"},
 		ValidAfter: NewTimeDuration(tm), ValidBefore: NewTimeDuration(tm.Add(hostDuration)),
 	}
 
 	type args struct {
 		token   string
-		sshOpts SSHOptions
+		sshOpts SignSSHOptions
 		key     interface{}
 	}
 	tests := []struct {
 		name        string
 		aws         *AWS
 		args        args
-		expected    *SSHOptions
+		expected    *SignSSHOptions
 		code        int
 		wantErr     bool
 		wantSignErr bool
 	}{
-		{"ok", p1, args{t1, SSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-rsa2048", p1, args{t1, SSHOptions{}, rsa2048.Public()}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-type", p1, args{t1, SSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-principals", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-principal-ip", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1"}}, pub}, expectedHostOptionsIP, http.StatusOK, false, false},
-		{"ok-principal-hostname", p1, args{t1, SSHOptions{Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptionsHostname, http.StatusOK, false, false},
-		{"ok-options", p1, args{t1, SSHOptions{CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
-		{"ok-custom", p2, args{t2, SSHOptions{Principals: []string{"foo.local"}}, pub}, expectedCustomOptions, http.StatusOK, false, false},
-		{"fail-rsa1024", p1, args{t1, SSHOptions{}, rsa1024.Public()}, expectedHostOptions, http.StatusOK, false, true},
-		{"fail-type", p1, args{t1, SSHOptions{CertType: "user"}, pub}, nil, http.StatusOK, false, true},
-		{"fail-principal", p1, args{t1, SSHOptions{Principals: []string{"smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
-		{"fail-extra-principal", p1, args{t1, SSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal", "smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
-		{"fail-sshCA-disabled", p3, args{"foo", SSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
-		{"fail-invalid-token", p1, args{"foo", SSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
+		{"ok", p1, args{t1, SignSSHOptions{}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-rsa2048", p1, args{t1, SignSSHOptions{}, rsa2048.Public()}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-type", p1, args{t1, SignSSHOptions{CertType: "host"}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-principals", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-principal-ip", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1"}}, pub}, expectedHostOptionsIP, http.StatusOK, false, false},
+		{"ok-principal-hostname", p1, args{t1, SignSSHOptions{Principals: []string{"ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptionsHostname, http.StatusOK, false, false},
+		{"ok-options", p1, args{t1, SignSSHOptions{CertType: "host", Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal"}}, pub}, expectedHostOptions, http.StatusOK, false, false},
+		{"ok-custom", p2, args{t2, SignSSHOptions{Principals: []string{"foo.local"}}, pub}, expectedCustomOptions, http.StatusOK, false, false},
+		{"fail-rsa1024", p1, args{t1, SignSSHOptions{}, rsa1024.Public()}, expectedHostOptions, http.StatusOK, false, true},
+		{"fail-type", p1, args{t1, SignSSHOptions{CertType: "user"}, pub}, nil, http.StatusOK, false, true},
+		{"fail-principal", p1, args{t1, SignSSHOptions{Principals: []string{"smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
+		{"fail-extra-principal", p1, args{t1, SignSSHOptions{Principals: []string{"127.0.0.1", "ip-127-0-0-1.us-west-1.compute.internal", "smallstep.com"}}, pub}, nil, http.StatusOK, false, true},
+		{"fail-sshCA-disabled", p3, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
+		{"fail-invalid-token", p1, args{"foo", SignSSHOptions{}, pub}, expectedHostOptions, http.StatusUnauthorized, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -755,8 +809,8 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 				return
 			}
 			if err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 				assert.Nil(t, got)
 			} else if assert.NotNil(t, got) {
@@ -776,6 +830,7 @@ func TestAWS_AuthorizeSSHSign(t *testing.T) {
 }
 
 func TestAWS_AuthorizeRenew(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
 	p1, err := generateAWS()
 	assert.FatalError(t, err)
 	p2, err := generateAWS()
@@ -784,7 +839,7 @@ func TestAWS_AuthorizeRenew(t *testing.T) {
 	// disable renewal
 	disable := true
 	p2.Claims = &Claims{DisableRenewal: &disable}
-	p2.claimer, err = NewClaimer(p2.Claims, globalProvisionerClaims)
+	p2.ctl.Claimer, err = NewClaimer(p2.Claims, globalProvisionerClaims)
 	assert.FatalError(t, err)
 
 	type args struct {
@@ -797,16 +852,22 @@ func TestAWS_AuthorizeRenew(t *testing.T) {
 		code    int
 		wantErr bool
 	}{
-		{"ok", p1, args{nil}, http.StatusOK, false},
-		{"fail/renew-disabled", p2, args{nil}, http.StatusUnauthorized, true},
+		{"ok", p1, args{&x509.Certificate{
+			NotBefore: now,
+			NotAfter:  now.Add(time.Hour),
+		}}, http.StatusOK, false},
+		{"fail/renew-disabled", p2, args{&x509.Certificate{
+			NotBefore: now,
+			NotAfter:  now.Add(time.Hour),
+		}}, http.StatusUnauthorized, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := tt.aws.AuthorizeRenew(context.Background(), tt.args.cert); (err != nil) != tt.wantErr {
 				t.Errorf("AWS.AuthorizeRenew() error = %v, wantErr %v", err, tt.wantErr)
 			} else if err != nil {
-				sc, ok := err.(errs.StatusCoder)
-				assert.Fatal(t, ok, "error does not implement StatusCoder interface")
+				var sc render.StatusCodedError
+				assert.Fatal(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
 				assert.Equals(t, sc.StatusCode(), tt.code)
 			}
 		})

@@ -6,9 +6,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -17,28 +18,33 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smallstep/certificates/kms"
-	"github.com/smallstep/certificates/kms/apiv1"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/ui"
-	"github.com/smallstep/cli/utils"
+	"go.step.sm/cli-utils/fileutil"
+	"go.step.sm/cli-utils/ui"
+	"go.step.sm/crypto/kms"
+	"go.step.sm/crypto/kms/apiv1"
+	"go.step.sm/crypto/pemutil"
 
 	// Enable yubikey.
-	_ "github.com/smallstep/certificates/kms/yubikey"
+	_ "go.step.sm/crypto/kms/yubikey"
 )
 
+// Config is a mapping of the cli flags.
 type Config struct {
-	RootOnly bool
-	RootSlot string
-	CrtSlot  string
-	RootFile string
-	KeyFile  string
-	Pin      string
-	Force    bool
+	RootOnly      bool
+	RootSlot      string
+	CrtSlot       string
+	RootFile      string
+	KeyFile       string
+	Pin           string
+	ManagementKey string
+	Force         bool
 }
 
+// Validate checks the flags in the config.
 func (c *Config) Validate() error {
 	switch {
+	case c.ManagementKey != "" && len(c.ManagementKey) != 48:
+		return errors.New("flag `--management-key` must be 48 hexadecimal characters (24 bytes)")
 	case c.RootFile != "" && c.KeyFile == "":
 		return errors.New("flag `--root` requires flag `--key`")
 	case c.KeyFile != "" && c.RootFile == "":
@@ -56,12 +62,18 @@ func (c *Config) Validate() error {
 		if c.RootOnly {
 			c.CrtSlot = ""
 		}
+		if c.ManagementKey != "" {
+			if _, err := hex.DecodeString(c.ManagementKey); err != nil {
+				return errors.Wrap(err, "flag `--management-key` is not valid")
+			}
+		}
 		return nil
 	}
 }
 
 func main() {
 	var c Config
+	flag.StringVar(&c.ManagementKey, "management-key", "", `Management key to use in hexadecimal format. (default "010203040506070801020304050607080102030405060708")`)
 	flag.BoolVar(&c.RootOnly, "root-only", false, "Slot only the root certificate and sign and intermediate.")
 	flag.StringVar(&c.RootSlot, "root-slot", "9a", "Slot to store the root certificate.")
 	flag.StringVar(&c.CrtSlot, "crt-slot", "9c", "Slot to store the intermediate certificate.")
@@ -75,6 +87,12 @@ func main() {
 		fatal(err)
 	}
 
+	// Initialize windows terminal
+	ui.Init()
+
+	ui.Println("⚠️  This command is deprecated and will be removed in future releases.")
+	ui.Println("⚠️  Please use https://github.com/smallstep/step-kms-plugin instead.")
+
 	pin, err := ui.PromptPassword("What is the YubiKey PIN?")
 	if err != nil {
 		fatal(err)
@@ -82,8 +100,9 @@ func main() {
 	c.Pin = string(pin)
 
 	k, err := kms.New(context.Background(), apiv1.Options{
-		Type: string(apiv1.YubiKey),
-		Pin:  c.Pin,
+		Type:          apiv1.YubiKey,
+		Pin:           c.Pin,
+		ManagementKey: c.ManagementKey,
 	})
 	if err != nil {
 		fatal(err)
@@ -106,10 +125,18 @@ func main() {
 	defer func() {
 		_ = k.Close()
 	}()
+
+	// Reset windows terminal
+	ui.Reset()
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, err)
+	if os.Getenv("STEPDEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "%+v\n", err)
+	} else {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	ui.Reset()
 	os.Exit(1)
 }
 
@@ -124,10 +151,11 @@ This tool is experimental and in the future it will be integrated in step cli.
 OPTIONS`)
 	fmt.Fprintln(os.Stderr)
 	flag.PrintDefaults()
-	fmt.Fprintln(os.Stderr, `
+	fmt.Fprintf(os.Stderr, `
 COPYRIGHT
 
-  (c) 2018-2020 Smallstep Labs, Inc.`)
+  (c) 2018-%d Smallstep Labs, Inc.
+`, time.Now().Year())
 	os.Exit(1)
 }
 
@@ -204,7 +232,7 @@ func createPKI(k kms.KeyManager, c Config) error {
 		}
 
 		if cm, ok := k.(kms.CertificateManager); ok {
-			if err = cm.StoreCertificate(&apiv1.StoreCertificateRequest{
+			if err := cm.StoreCertificate(&apiv1.StoreCertificateRequest{
 				Name:        c.RootSlot,
 				Certificate: root,
 			}); err != nil {
@@ -212,7 +240,7 @@ func createPKI(k kms.KeyManager, c Config) error {
 			}
 		}
 
-		if err = utils.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
+		if err := fileutil.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
 			Type:  "CERTIFICATE",
 			Bytes: b,
 		}), 0600); err != nil {
@@ -281,7 +309,7 @@ func createPKI(k kms.KeyManager, c Config) error {
 	}
 
 	if cm, ok := k.(kms.CertificateManager); ok {
-		if err = cm.StoreCertificate(&apiv1.StoreCertificateRequest{
+		if err := cm.StoreCertificate(&apiv1.StoreCertificateRequest{
 			Name:        c.CrtSlot,
 			Certificate: intermediate,
 		}); err != nil {
@@ -289,7 +317,7 @@ func createPKI(k kms.KeyManager, c Config) error {
 		}
 	}
 
-	if err = utils.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
+	if err := fileutil.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: b,
 	}), 0600); err != nil {
@@ -321,6 +349,7 @@ func mustSubjectKeyID(key crypto.PublicKey) []byte {
 	if err != nil {
 		panic(err)
 	}
+	//nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	hash := sha1.Sum(b)
 	return hash[:]
 }

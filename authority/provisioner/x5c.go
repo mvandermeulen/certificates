@@ -8,8 +8,13 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/sshutil"
+	"go.step.sm/crypto/x509util"
+	"go.step.sm/linkedca"
+
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
 )
 
 // x5cPayload extends jwt.Claims with step attributes.
@@ -24,18 +29,28 @@ type x5cPayload struct {
 // signature requests.
 type X5C struct {
 	*base
-	Type      string  `json:"type"`
-	Name      string  `json:"name"`
-	Roots     []byte  `json:"roots"`
-	Claims    *Claims `json:"claims,omitempty"`
-	claimer   *Claimer
-	audiences Audiences
-	rootPool  *x509.CertPool
+	ID       string   `json:"-"`
+	Type     string   `json:"type"`
+	Name     string   `json:"name"`
+	Roots    []byte   `json:"roots"`
+	Claims   *Claims  `json:"claims,omitempty"`
+	Options  *Options `json:"options,omitempty"`
+	ctl      *Controller
+	rootPool *x509.CertPool
 }
 
 // GetID returns the provisioner unique identifier. The name and credential id
 // should uniquely identify any X5C provisioner.
 func (p *X5C) GetID() string {
+	if p.ID != "" {
+		return p.ID
+	}
+	return p.GetIDForToken()
+}
+
+// GetIDForToken returns an identifier that will be used to load the provisioner
+// from a token.
+func (p *X5C) GetIDForToken() string {
 	return "x5c/" + p.Name
 }
 
@@ -73,7 +88,7 @@ func (p *X5C) GetEncryptedKey() (string, string, bool) {
 }
 
 // Init initializes and validates the fields of a X5C type.
-func (p *X5C) Init(config Config) error {
+func (p *X5C) Init(config Config) (err error) {
 	switch {
 	case p.Type == "":
 		return errors.New("provisioner type cannot be empty")
@@ -88,6 +103,7 @@ func (p *X5C) Init(config Config) error {
 	var (
 		block *pem.Block
 		rest  = p.Roots
+		count int
 	)
 	for rest != nil {
 		block, rest = pem.Decode(rest)
@@ -98,22 +114,18 @@ func (p *X5C) Init(config Config) error {
 		if err != nil {
 			return errors.Wrap(err, "error parsing x509 certificate from PEM block")
 		}
+		count++
 		p.rootPool.AddCert(cert)
 	}
 
 	// Verify that at least one root was found.
-	if len(p.rootPool.Subjects()) == 0 {
-		return errors.Errorf("no x509 certificates found in roots attribute for provisioner %s", p.GetName())
+	if count == 0 {
+		return errors.Errorf("no x509 certificates found in roots attribute for provisioner '%s'", p.GetName())
 	}
 
-	// Update claims with global ones
-	var err error
-	if p.claimer, err = NewClaimer(p.Claims, config.Claims); err != nil {
-		return err
-	}
-
-	p.audiences = config.Audiences.WithFragment(p.GetID())
-	return nil
+	config.Audiences = config.Audiences.WithFragment(p.GetIDForToken())
+	p.ctl, err = NewController(p, p.Claims, config, p.Options)
+	return
 }
 
 // authorizeToken performs common jwt authorization actions and returns the
@@ -126,7 +138,8 @@ func (p *X5C) authorizeToken(token string, audiences []string) (*x5cPayload, err
 	}
 
 	verifiedChains, err := jwt.Headers[0].Certificates(x509.VerifyOptions{
-		Roots: p.rootPool,
+		Roots:     p.rootPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	})
 	if err != nil {
 		return nil, errs.Wrap(http.StatusUnauthorized, err,
@@ -175,13 +188,13 @@ func (p *X5C) authorizeToken(token string, audiences []string) (*x5cPayload, err
 // AuthorizeRevoke returns an error if the provisioner does not have rights to
 // revoke the certificate with serial number in the `sub` property.
 func (p *X5C) AuthorizeRevoke(ctx context.Context, token string) error {
-	_, err := p.authorizeToken(token, p.audiences.Revoke)
+	_, err := p.authorizeToken(token, p.ctl.Audiences.Revoke)
 	return errs.Wrap(http.StatusInternalServerError, err, "x5c.AuthorizeRevoke")
 }
 
 // AuthorizeSign validates the given token.
 func (p *X5C) AuthorizeSign(ctx context.Context, token string) ([]SignOption, error) {
-	claims, err := p.authorizeToken(token, p.audiences.Sign)
+	claims, err := p.authorizeToken(token, p.ctl.Audiences.Sign)
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "x5c.AuthorizeSign")
 	}
@@ -193,34 +206,62 @@ func (p *X5C) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 		claims.SANs = []string{claims.Subject}
 	}
 
+	// Certificate templates
+	data := x509util.CreateTemplateData(claims.Subject, claims.SANs)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
+	}
+
+	// The X509 certificate will be available using the template variable
+	// AuthorizationCrt. For example {{ .AuthorizationCrt.DNSNames }} can be
+	// used to get all the domains.
+	data.SetAuthorizationCertificate(claims.chains[0][0])
+
+	templateOptions, err := TemplateOptions(p.Options, data)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "jwk.AuthorizeSign")
+	}
+
+	// Wrap provisioner if the token is an RA token.
+	var self Interface = p
+	if claims.Step != nil && claims.Step.RA != nil {
+		self = &raProvisioner{
+			Interface: p,
+			raInfo:    claims.Step.RA,
+		}
+	}
+
 	return []SignOption{
+		self,
+		templateOptions,
 		// modifiers / withOptions
 		newProvisionerExtensionOption(TypeX5C, p.Name, ""),
-		profileLimitDuration{p.claimer.DefaultTLSCertDuration(),
-			claims.chains[0][0].NotBefore, claims.chains[0][0].NotAfter},
+		profileLimitDuration{
+			p.ctl.Claimer.DefaultTLSCertDuration(),
+			claims.chains[0][0].NotBefore, claims.chains[0][0].NotAfter,
+		},
 		// validators
 		commonNameValidator(claims.Subject),
 		defaultSANsValidator(claims.SANs),
 		defaultPublicKeyValidator{},
-		newValidityValidator(p.claimer.MinTLSCertDuration(), p.claimer.MaxTLSCertDuration()),
+		newValidityValidator(p.ctl.Claimer.MinTLSCertDuration(), p.ctl.Claimer.MaxTLSCertDuration()),
+		newX509NamePolicyValidator(p.ctl.getPolicy().getX509()),
+		p.ctl.newWebhookController(data, linkedca.Webhook_X509),
 	}, nil
 }
 
 // AuthorizeRenew returns an error if the renewal is disabled.
 func (p *X5C) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
-	if p.claimer.IsDisableRenewal() {
-		return errs.Unauthorized("x5c.AuthorizeRenew; renew is disabled for x5c provisioner %s", p.GetID())
-	}
-	return nil
+	return p.ctl.AuthorizeRenew(ctx, cert)
 }
 
 // AuthorizeSSHSign returns the list of SignOption for a SignSSH request.
 func (p *X5C) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption, error) {
-	if !p.claimer.IsSSHCAEnabled() {
-		return nil, errs.Unauthorized("x5c.AuthorizeSSHSign; sshCA is disabled for x5c provisioner %s", p.GetID())
+	if !p.ctl.Claimer.IsSSHCAEnabled() {
+		return nil, errs.Unauthorized("x5c.AuthorizeSSHSign; sshCA is disabled for x5c provisioner '%s'", p.GetName())
 	}
 
-	claims, err := p.authorizeToken(token, p.audiences.SSHSign)
+	claims, err := p.authorizeToken(token, p.ctl.Audiences.SSHSign)
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "x5c.AuthorizeSSHSign")
 	}
@@ -233,16 +274,46 @@ func (p *X5C) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption,
 	signOptions := []SignOption{
 		// validates user's SSHOptions with the ones in the token
 		sshCertOptionsValidator(*opts),
+		// validate users's KeyID is the token subject.
+		sshCertOptionsValidator(SignSSHOptions{KeyID: claims.Subject}),
 	}
 
-	// Add modifiers from custom claims
-	// FIXME: this is also set in the sign method using SSHOptions.Modify.
+	// Default template attributes.
+	certType := sshutil.UserCert
+	keyID := claims.Subject
+	principals := []string{claims.Subject}
+
+	// Use options in the token.
 	if opts.CertType != "" {
-		signOptions = append(signOptions, sshCertTypeModifier(opts.CertType))
+		if certType, err = sshutil.CertTypeFromString(opts.CertType); err != nil {
+			return nil, errs.BadRequestErr(err, err.Error())
+		}
+	}
+	if opts.KeyID != "" {
+		keyID = opts.KeyID
 	}
 	if len(opts.Principals) > 0 {
-		signOptions = append(signOptions, sshCertPrincipalsModifier(opts.Principals))
+		principals = opts.Principals
 	}
+
+	// Certificate templates.
+	data := sshutil.CreateTemplateData(certType, keyID, principals)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
+	}
+
+	// The X509 certificate will be available using the template variable
+	// AuthorizationCrt. For example {{ .AuthorizationCrt.DNSNames }} can be
+	// used to get all the domains.
+	data.SetAuthorizationCertificate(claims.chains[0][0])
+
+	templateOptions, err := TemplateSSHOptions(p.Options, data)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "x5c.AuthorizeSSHSign")
+	}
+	signOptions = append(signOptions, templateOptions)
+
+	// Add modifiers from custom claims
 	t := now()
 	if !opts.ValidAfter.IsZero() {
 		signOptions = append(signOptions, sshCertValidAfterModifier(opts.ValidAfter.RelativeTime(t).Unix()))
@@ -250,26 +321,20 @@ func (p *X5C) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption,
 	if !opts.ValidBefore.IsZero() {
 		signOptions = append(signOptions, sshCertValidBeforeModifier(opts.ValidBefore.RelativeTime(t).Unix()))
 	}
-	// Make sure to define the the KeyID
-	if opts.KeyID == "" {
-		signOptions = append(signOptions, sshCertKeyIDModifier(claims.Subject))
-	}
-
-	// Default to a user certificate with no principals if not set
-	signOptions = append(signOptions, sshCertDefaultsModifier{CertType: SSHUserCert})
 
 	return append(signOptions,
-		// Set the default extensions.
-		&sshDefaultExtensionModifier{},
+		p,
 		// Checks the validity bounds, and set the validity if has not been set.
-		&sshLimitDuration{p.claimer, claims.chains[0][0].NotAfter},
-		// set the key id to the token subject
-		sshCertKeyIDValidator(claims.Subject),
+		&sshLimitDuration{p.ctl.Claimer, claims.chains[0][0].NotAfter},
 		// Validate public key.
 		&sshDefaultPublicKeyValidator{},
 		// Validate the validity period.
-		&sshCertValidityValidator{p.claimer},
+		&sshCertValidityValidator{p.ctl.Claimer},
 		// Require all the fields in the SSH certificate
 		&sshCertDefaultValidator{},
+		// Ensure that all principal names are allowed
+		newSSHNamePolicyValidator(p.ctl.getPolicy().getSSHHost(), p.ctl.getPolicy().getSSHUser()),
+		// Call webhooks
+		p.ctl.newWebhookController(data, linkedca.Webhook_SSH),
 	), nil
 }

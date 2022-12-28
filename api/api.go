@@ -3,8 +3,9 @@ package api
 import (
 	"context"
 	"crypto"
-	"crypto/dsa"
+	"crypto/dsa" //nolint:staticcheck // support legacy algorithms
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
@@ -19,11 +20,14 @@ import (
 
 	"github.com/go-chi/chi"
 	"github.com/pkg/errors"
+
+	"github.com/smallstep/certificates/api/log"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority"
+	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
-	"github.com/smallstep/cli/crypto/tlsutil"
 )
 
 // Authority is the interface implemented by a CA authority.
@@ -31,20 +35,27 @@ type Authority interface {
 	SSHAuthority
 	// context specifies the Authorize[Sign|Revoke|etc.] method.
 	Authorize(ctx context.Context, ott string) ([]provisioner.SignOption, error)
-	AuthorizeSign(ott string) ([]provisioner.SignOption, error)
-	GetTLSOptions() *tlsutil.TLSOptions
+	AuthorizeRenewToken(ctx context.Context, ott string) (*x509.Certificate, error)
+	GetTLSOptions() *config.TLSOptions
 	Root(shasum string) (*x509.Certificate, error)
-	Sign(cr *x509.CertificateRequest, opts provisioner.Options, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
+	Sign(cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
 	Renew(peer *x509.Certificate) ([]*x509.Certificate, error)
+	RenewContext(ctx context.Context, peer *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
 	Rekey(peer *x509.Certificate, pk crypto.PublicKey) ([]*x509.Certificate, error)
 	LoadProvisionerByCertificate(*x509.Certificate) (provisioner.Interface, error)
-	LoadProvisionerByID(string) (provisioner.Interface, error)
+	LoadProvisionerByName(string) (provisioner.Interface, error)
 	GetProvisioners(cursor string, limit int) (provisioner.List, string, error)
 	Revoke(context.Context, *authority.RevokeOptions) error
 	GetEncryptedKey(kid string) (string, error)
-	GetRoots() (federation []*x509.Certificate, err error)
+	GetRoots() ([]*x509.Certificate, error)
 	GetFederation() ([]*x509.Certificate, error)
 	Version() authority.Version
+	GetCertificateRevocationList() ([]byte, error)
+}
+
+// mustAuthority will be replaced on unit tests.
+var mustAuthority = func(ctx context.Context) Authority {
+	return authority.MustFromContext(ctx)
 }
 
 // TimeDuration is an alias of provisioner.TimeDuration
@@ -238,71 +249,78 @@ type caHandler struct {
 	Authority Authority
 }
 
-// New creates a new RouterHandler with the CA endpoints.
-func New(authority Authority) RouterHandler {
-	return &caHandler{
-		Authority: authority,
-	}
+// Route configures the http request router.
+func (h *caHandler) Route(r Router) {
+	Route(r)
 }
 
-func (h *caHandler) Route(r Router) {
-	r.MethodFunc("GET", "/version", h.Version)
-	r.MethodFunc("GET", "/health", h.Health)
-	r.MethodFunc("GET", "/root/{sha}", h.Root)
-	r.MethodFunc("POST", "/sign", h.Sign)
-	r.MethodFunc("POST", "/renew", h.Renew)
-	r.MethodFunc("POST", "/rekey", h.Rekey)
-	r.MethodFunc("POST", "/revoke", h.Revoke)
-	r.MethodFunc("GET", "/provisioners", h.Provisioners)
-	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", h.ProvisionerKey)
-	r.MethodFunc("GET", "/roots", h.Roots)
-	r.MethodFunc("GET", "/federation", h.Federation)
+// New creates a new RouterHandler with the CA endpoints.
+//
+// Deprecated: Use api.Route(r Router)
+func New(auth Authority) RouterHandler {
+	return &caHandler{}
+}
+
+func Route(r Router) {
+	r.MethodFunc("GET", "/version", Version)
+	r.MethodFunc("GET", "/health", Health)
+	r.MethodFunc("GET", "/root/{sha}", Root)
+	r.MethodFunc("POST", "/sign", Sign)
+	r.MethodFunc("POST", "/renew", Renew)
+	r.MethodFunc("POST", "/rekey", Rekey)
+	r.MethodFunc("POST", "/revoke", Revoke)
+	r.MethodFunc("GET", "/crl", CRL)
+	r.MethodFunc("GET", "/provisioners", Provisioners)
+	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", ProvisionerKey)
+	r.MethodFunc("GET", "/roots", Roots)
+	r.MethodFunc("GET", "/roots.pem", RootsPEM)
+	r.MethodFunc("GET", "/federation", Federation)
 	// SSH CA
-	r.MethodFunc("POST", "/ssh/sign", h.SSHSign)
-	r.MethodFunc("POST", "/ssh/renew", h.SSHRenew)
-	r.MethodFunc("POST", "/ssh/revoke", h.SSHRevoke)
-	r.MethodFunc("POST", "/ssh/rekey", h.SSHRekey)
-	r.MethodFunc("GET", "/ssh/roots", h.SSHRoots)
-	r.MethodFunc("GET", "/ssh/federation", h.SSHFederation)
-	r.MethodFunc("POST", "/ssh/config", h.SSHConfig)
-	r.MethodFunc("POST", "/ssh/config/{type}", h.SSHConfig)
-	r.MethodFunc("POST", "/ssh/check-host", h.SSHCheckHost)
-	r.MethodFunc("GET", "/ssh/hosts", h.SSHGetHosts)
-	r.MethodFunc("POST", "/ssh/bastion", h.SSHBastion)
+	r.MethodFunc("POST", "/ssh/sign", SSHSign)
+	r.MethodFunc("POST", "/ssh/renew", SSHRenew)
+	r.MethodFunc("POST", "/ssh/revoke", SSHRevoke)
+	r.MethodFunc("POST", "/ssh/rekey", SSHRekey)
+	r.MethodFunc("GET", "/ssh/roots", SSHRoots)
+	r.MethodFunc("GET", "/ssh/federation", SSHFederation)
+	r.MethodFunc("POST", "/ssh/config", SSHConfig)
+	r.MethodFunc("POST", "/ssh/config/{type}", SSHConfig)
+	r.MethodFunc("POST", "/ssh/check-host", SSHCheckHost)
+	r.MethodFunc("GET", "/ssh/hosts", SSHGetHosts)
+	r.MethodFunc("POST", "/ssh/bastion", SSHBastion)
 
 	// For compatibility with old code:
-	r.MethodFunc("POST", "/re-sign", h.Renew)
-	r.MethodFunc("POST", "/sign-ssh", h.SSHSign)
-	r.MethodFunc("GET", "/ssh/get-hosts", h.SSHGetHosts)
+	r.MethodFunc("POST", "/re-sign", Renew)
+	r.MethodFunc("POST", "/sign-ssh", SSHSign)
+	r.MethodFunc("GET", "/ssh/get-hosts", SSHGetHosts)
 }
 
 // Version is an HTTP handler that returns the version of the server.
-func (h *caHandler) Version(w http.ResponseWriter, r *http.Request) {
-	v := h.Authority.Version()
-	JSON(w, VersionResponse{
+func Version(w http.ResponseWriter, r *http.Request) {
+	v := mustAuthority(r.Context()).Version()
+	render.JSON(w, VersionResponse{
 		Version:                     v.Version,
 		RequireClientAuthentication: v.RequireClientAuthentication,
 	})
 }
 
 // Health is an HTTP handler that returns the status of the server.
-func (h *caHandler) Health(w http.ResponseWriter, r *http.Request) {
-	JSON(w, HealthResponse{Status: "ok"})
+func Health(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, HealthResponse{Status: "ok"})
 }
 
 // Root is an HTTP handler that using the SHA256 from the URL, returns the root
 // certificate for the given SHA256.
-func (h *caHandler) Root(w http.ResponseWriter, r *http.Request) {
+func Root(w http.ResponseWriter, r *http.Request) {
 	sha := chi.URLParam(r, "sha")
-	sum := strings.ToLower(strings.Replace(sha, "-", "", -1))
+	sum := strings.ToLower(strings.ReplaceAll(sha, "-", ""))
 	// Load root certificate with the
-	cert, err := h.Authority.Root(sum)
+	cert, err := mustAuthority(r.Context()).Root(sum)
 	if err != nil {
-		WriteError(w, errs.Wrapf(http.StatusNotFound, err, "%s was not found", r.RequestURI))
+		render.Error(w, errs.Wrapf(http.StatusNotFound, err, "%s was not found", r.RequestURI))
 		return
 	}
 
-	JSON(w, &RootResponse{RootPEM: Certificate{cert}})
+	render.JSON(w, &RootResponse{RootPEM: Certificate{cert}})
 }
 
 func certChainToPEM(certChain []*x509.Certificate) []Certificate {
@@ -314,40 +332,42 @@ func certChainToPEM(certChain []*x509.Certificate) []Certificate {
 }
 
 // Provisioners returns the list of provisioners configured in the authority.
-func (h *caHandler) Provisioners(w http.ResponseWriter, r *http.Request) {
-	cursor, limit, err := parseCursor(r)
+func Provisioners(w http.ResponseWriter, r *http.Request) {
+	cursor, limit, err := ParseCursor(r)
 	if err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, err)
 		return
 	}
 
-	p, next, err := h.Authority.GetProvisioners(cursor, limit)
+	p, next, err := mustAuthority(r.Context()).GetProvisioners(cursor, limit)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, errs.InternalServerErr(err))
 		return
 	}
-	JSON(w, &ProvisionersResponse{
+
+	render.JSON(w, &ProvisionersResponse{
 		Provisioners: p,
 		NextCursor:   next,
 	})
 }
 
 // ProvisionerKey returns the encrypted key of a provisioner by it's key id.
-func (h *caHandler) ProvisionerKey(w http.ResponseWriter, r *http.Request) {
+func ProvisionerKey(w http.ResponseWriter, r *http.Request) {
 	kid := chi.URLParam(r, "kid")
-	key, err := h.Authority.GetEncryptedKey(kid)
+	key, err := mustAuthority(r.Context()).GetEncryptedKey(kid)
 	if err != nil {
-		WriteError(w, errs.NotFoundErr(err))
+		render.Error(w, errs.NotFoundErr(err))
 		return
 	}
-	JSON(w, &ProvisionerKeyResponse{key})
+
+	render.JSON(w, &ProvisionerKeyResponse{key})
 }
 
 // Roots returns all the root certificates for the CA.
-func (h *caHandler) Roots(w http.ResponseWriter, r *http.Request) {
-	roots, err := h.Authority.GetRoots()
+func Roots(w http.ResponseWriter, r *http.Request) {
+	roots, err := mustAuthority(r.Context()).GetRoots()
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		render.Error(w, errs.ForbiddenErr(err, "error getting roots"))
 		return
 	}
 
@@ -356,16 +376,39 @@ func (h *caHandler) Roots(w http.ResponseWriter, r *http.Request) {
 		certs[i] = Certificate{roots[i]}
 	}
 
-	JSONStatus(w, &RootsResponse{
+	render.JSONStatus(w, &RootsResponse{
 		Certificates: certs,
 	}, http.StatusCreated)
 }
 
-// Federation returns all the public certificates in the federation.
-func (h *caHandler) Federation(w http.ResponseWriter, r *http.Request) {
-	federated, err := h.Authority.GetFederation()
+// RootsPEM returns all the root certificates for the CA in PEM format.
+func RootsPEM(w http.ResponseWriter, r *http.Request) {
+	roots, err := mustAuthority(r.Context()).GetRoots()
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		render.Error(w, errs.InternalServerErr(err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-pem-file")
+
+	for _, root := range roots {
+		block := pem.EncodeToMemory(&pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: root.Raw,
+		})
+
+		if _, err := w.Write(block); err != nil {
+			log.Error(w, err)
+			return
+		}
+	}
+}
+
+// Federation returns all the public certificates in the federation.
+func Federation(w http.ResponseWriter, r *http.Request) {
+	federated, err := mustAuthority(r.Context()).GetFederation()
+	if err != nil {
+		render.Error(w, errs.ForbiddenErr(err, "error getting federated roots"))
 		return
 	}
 
@@ -374,7 +417,7 @@ func (h *caHandler) Federation(w http.ResponseWriter, r *http.Request) {
 		certs[i] = Certificate{federated[i]}
 	}
 
-	JSONStatus(w, &FederationResponse{
+	render.JSONStatus(w, &FederationResponse{
 		Certificates: certs,
 	}, http.StatusCreated)
 }
@@ -395,10 +438,11 @@ func logOtt(w http.ResponseWriter, token string) {
 	}
 }
 
-func logCertificate(w http.ResponseWriter, cert *x509.Certificate) {
+// LogCertificate add certificate fields to the log message.
+func LogCertificate(w http.ResponseWriter, cert *x509.Certificate) {
 	if rl, ok := w.(logging.ResponseLogger); ok {
 		m := map[string]interface{}{
-			"serial":      cert.SerialNumber,
+			"serial":      cert.SerialNumber.String(),
 			"subject":     cert.Subject.CommonName,
 			"issuer":      cert.Issuer.CommonName,
 			"valid-from":  cert.NotBefore.Format(time.RFC3339),
@@ -407,33 +451,38 @@ func logCertificate(w http.ResponseWriter, cert *x509.Certificate) {
 			"certificate": base64.StdEncoding.EncodeToString(cert.Raw),
 		}
 		for _, ext := range cert.Extensions {
-			if ext.Id.Equal(oidStepProvisioner) {
-				val := &stepProvisioner{}
-				rest, err := asn1.Unmarshal(ext.Value, val)
-				if err != nil || len(rest) > 0 {
-					break
-				}
-				m["provisioner"] = fmt.Sprintf("%s (%s)", val.Name, val.CredentialID)
+			if !ext.Id.Equal(oidStepProvisioner) {
+				continue
+			}
+			val := &stepProvisioner{}
+			rest, err := asn1.Unmarshal(ext.Value, val)
+			if err != nil || len(rest) > 0 {
 				break
 			}
+			if len(val.CredentialID) > 0 {
+				m["provisioner"] = fmt.Sprintf("%s (%s)", val.Name, val.CredentialID)
+			} else {
+				m["provisioner"] = string(val.Name)
+			}
+			break
 		}
 		rl.WithFields(m)
 	}
 }
 
-func parseCursor(r *http.Request) (cursor string, limit int, err error) {
+// ParseCursor parses the cursor and limit from the request query params.
+func ParseCursor(r *http.Request) (cursor string, limit int, err error) {
 	q := r.URL.Query()
 	cursor = q.Get("cursor")
 	if v := q.Get("limit"); len(v) > 0 {
 		limit, err = strconv.Atoi(v)
 		if err != nil {
-			return "", 0, errors.Wrapf(err, "error converting %s to integer", v)
+			return "", 0, errs.BadRequestErr(err, "limit '%s' is not an integer", v)
 		}
 	}
 	return
 }
 
-// TODO: add support for Ed25519 once it's supported
 func fmtPublicKey(cert *x509.Certificate) string {
 	var params string
 	switch pk := cert.PublicKey.(type) {
@@ -441,6 +490,8 @@ func fmtPublicKey(cert *x509.Certificate) string {
 		params = pk.Curve.Params().Name
 	case *rsa.PublicKey:
 		params = strconv.Itoa(pk.Size() * 8)
+	case ed25519.PublicKey:
+		return cert.PublicKeyAlgorithm.String()
 	case *dsa.PublicKey:
 		params = strconv.Itoa(pk.Q.BitLen() * 8)
 	default:

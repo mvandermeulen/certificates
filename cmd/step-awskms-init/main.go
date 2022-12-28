@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -14,25 +14,31 @@ import (
 	"os"
 	"time"
 
-	"github.com/smallstep/certificates/kms/apiv1"
-	"github.com/smallstep/certificates/kms/awskms"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/ui"
-	"github.com/smallstep/cli/utils"
+	"go.step.sm/cli-utils/fileutil"
+	"go.step.sm/cli-utils/ui"
+	"go.step.sm/crypto/kms/apiv1"
+	"go.step.sm/crypto/kms/awskms"
+	"go.step.sm/crypto/pemutil"
 	"golang.org/x/crypto/ssh"
 )
 
 func main() {
 	var credentialsFile, region string
-	var ssh bool
+	var enableSSH bool
 	flag.StringVar(&credentialsFile, "credentials-file", "", "Path to the `file` containing the AWS KMS credentials.")
 	flag.StringVar(&region, "region", "", "AWS KMS region name.")
-	flag.BoolVar(&ssh, "ssh", false, "Create SSH keys.")
+	flag.BoolVar(&enableSSH, "ssh", false, "Create SSH keys.")
 	flag.Usage = usage
 	flag.Parse()
 
+	// Initialize windows terminal
+	ui.Init()
+
+	ui.Println("⚠️  This command is deprecated and will be removed in future releases.")
+	ui.Println("⚠️  Please use https://github.com/smallstep/step-kms-plugin instead.")
+
 	c, err := awskms.New(context.Background(), apiv1.Options{
-		Type:            string(apiv1.AmazonKMS),
+		Type:            apiv1.AmazonKMS,
 		Region:          region,
 		CredentialsFile: credentialsFile,
 	})
@@ -44,16 +50,20 @@ func main() {
 		fatal(err)
 	}
 
-	if ssh {
+	if enableSSH {
 		ui.Println()
 		if err := createSSH(c); err != nil {
 			fatal(err)
 		}
 	}
+
+	// Reset windows terminal
+	ui.Reset()
 }
 
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, err)
+	ui.Reset()
 	os.Exit(1)
 }
 
@@ -68,10 +78,11 @@ This tool is experimental and in the future it will be integrated in step cli.
 OPTIONS`)
 	fmt.Fprintln(os.Stderr)
 	flag.PrintDefaults()
-	fmt.Fprintln(os.Stderr, `
+	fmt.Fprintf(os.Stderr, `
 COPYRIGHT
 
-  (c) 2018-2020 Smallstep Labs, Inc.`)
+  (c) 2018-%d Smallstep Labs, Inc.
+`, time.Now().Year())
 	os.Exit(1)
 }
 
@@ -113,7 +124,7 @@ func createX509(c *awskms.KMS) error {
 		return err
 	}
 
-	if err = utils.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
+	if err := fileutil.WriteFile("root_ca.crt", pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: b,
 	}), 0600); err != nil {
@@ -156,7 +167,7 @@ func createX509(c *awskms.KMS) error {
 		return err
 	}
 
-	if err = utils.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
+	if err := fileutil.WriteFile("intermediate_ca.crt", pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: b,
 	}), 0600); err != nil {
@@ -186,7 +197,7 @@ func createSSH(c *awskms.KMS) error {
 		return err
 	}
 
-	if err = utils.WriteFile("ssh_user_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
+	if err := fileutil.WriteFile("ssh_user_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
 		return err
 	}
 
@@ -207,7 +218,7 @@ func createSSH(c *awskms.KMS) error {
 		return err
 	}
 
-	if err = utils.WriteFile("ssh_host_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
+	if err := fileutil.WriteFile("ssh_host_ca_key.pub", ssh.MarshalAuthorizedKey(key), 0600); err != nil {
 		return err
 	}
 
@@ -231,6 +242,7 @@ func mustSubjectKeyID(key crypto.PublicKey) []byte {
 	if err != nil {
 		panic(err)
 	}
+	//nolint:gosec // used to create the Subject Key Identifier by RFC 5280
 	hash := sha1.Sum(b)
 	return hash[:]
 }

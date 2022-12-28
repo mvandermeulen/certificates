@@ -2,6 +2,7 @@ package ca
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,8 +13,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,11 +29,14 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/ca/identity"
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/config"
-	"github.com/smallstep/cli/crypto/keys"
-	"github.com/smallstep/cli/crypto/pemutil"
-	"github.com/smallstep/cli/crypto/x509util"
+	"go.step.sm/cli-utils/step"
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/keyutil"
+	"go.step.sm/crypto/pemutil"
+	"go.step.sm/crypto/x509util"
 	"golang.org/x/net/http2"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"gopkg.in/square/go-jose.v2/jwt"
 )
 
@@ -53,12 +58,11 @@ func newClient(transport http.RoundTripper) *uaClient {
 	}
 }
 
+//nolint:gosec // used in bootstrap protocol
 func newInsecureClient() *uaClient {
 	return &uaClient{
 		Client: &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+			Transport: getDefaultTransport(&tls.Config{InsecureSkipVerify: true}),
 		},
 	}
 }
@@ -71,21 +75,34 @@ func (c *uaClient) SetTransport(tr http.RoundTripper) {
 	c.Client.Transport = tr
 }
 
-func (c *uaClient) Get(url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func (c *uaClient) Get(u string) (*http.Response, error) {
+	return c.GetWithContext(context.Background(), u)
+}
+
+func (c *uaClient) GetWithContext(ctx context.Context, u string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", u, http.NoBody)
 	if err != nil {
-		return nil, errors.Wrapf(err, "new request GET %s failed", url)
+		return nil, errors.Wrapf(err, "create GET %s request failed", u)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	return c.Client.Do(req)
 }
 
-func (c *uaClient) Post(url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequest("POST", url, body)
+func (c *uaClient) Post(u, contentType string, body io.Reader) (*http.Response, error) {
+	return c.PostWithContext(context.Background(), u, contentType, body)
+}
+
+func (c *uaClient) PostWithContext(ctx context.Context, u, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", u, body)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "create POST %s request failed", u)
 	}
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("User-Agent", UserAgent)
+	return c.Client.Do(req)
+}
+
+func (c *uaClient) Do(req *http.Request) (*http.Response, error) {
 	req.Header.Set("User-Agent", UserAgent)
 	return c.Client.Do(req)
 }
@@ -98,18 +115,22 @@ type RetryFunc func(code int) bool
 type ClientOption func(o *clientOptions) error
 
 type clientOptions struct {
-	transport    http.RoundTripper
-	rootSHA256   string
-	rootFilename string
-	rootBundle   []byte
-	certificate  tls.Certificate
-	retryFunc    RetryFunc
+	transport            http.RoundTripper
+	rootSHA256           string
+	rootFilename         string
+	rootBundle           []byte
+	certificate          tls.Certificate
+	getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	retryFunc            RetryFunc
+	x5cJWK               *jose.JSONWebKey
+	x5cCertFile          string
+	x5cCertStrs          []string
+	x5cCert              *x509.Certificate
+	x5cSubject           string
 }
 
 func (o *clientOptions) apply(opts []ClientOption) (err error) {
-	if err = o.applyDefaultIdentity(); err != nil {
-		return
-	}
+	o.applyDefaultIdentity()
 	for _, fn := range opts {
 		if err = fn(o); err != nil {
 			return
@@ -120,25 +141,25 @@ func (o *clientOptions) apply(opts []ClientOption) (err error) {
 
 // applyDefaultIdentity sets the options for the default identity if the
 // identity file is present. The identity is enabled by default.
-func (o *clientOptions) applyDefaultIdentity() error {
+func (o *clientOptions) applyDefaultIdentity() {
 	if DisableIdentity {
-		return nil
+		return
 	}
 
 	// Do not load an identity if something fails
 	i, err := identity.LoadDefaultIdentity()
 	if err != nil {
-		return nil
+		return
 	}
 	if err := i.Validate(); err != nil {
-		return nil
+		return
 	}
 	crt, err := i.TLSCertificate()
 	if err != nil {
-		return nil
+		return
 	}
 	o.certificate = crt
-	return nil
+	o.getClientCertificate = i.GetClientCertificateFunc()
 }
 
 // checkTransport checks if other ways to set up a transport have been provided.
@@ -188,17 +209,23 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 		switch tr := tr.(type) {
 		case *http.Transport:
 			if tr.TLSClientConfig == nil {
-				tr.TLSClientConfig = &tls.Config{}
+				tr.TLSClientConfig = &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				}
 			}
 			if len(tr.TLSClientConfig.Certificates) == 0 && tr.TLSClientConfig.GetClientCertificate == nil {
 				tr.TLSClientConfig.Certificates = []tls.Certificate{o.certificate}
+				tr.TLSClientConfig.GetClientCertificate = o.getClientCertificate
 			}
 		case *http2.Transport:
 			if tr.TLSClientConfig == nil {
-				tr.TLSClientConfig = &tls.Config{}
+				tr.TLSClientConfig = &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				}
 			}
 			if len(tr.TLSClientConfig.Certificates) == 0 && tr.TLSClientConfig.GetClientCertificate == nil {
 				tr.TLSClientConfig.Certificates = []tls.Certificate{o.certificate}
+				tr.TLSClientConfig.GetClientCertificate = o.getClientCertificate
 			}
 		default:
 			return nil, errors.Errorf("unsupported transport type %T", tr)
@@ -208,7 +235,7 @@ func (o *clientOptions) getTransport(endpoint string) (tr http.RoundTripper, err
 	return tr, nil
 }
 
-// WithTransport adds a custom transport to the Client.  It will fail if a
+// WithTransport adds a custom transport to the Client. It will fail if a
 // previous option to create the transport has been configured.
 func WithTransport(tr http.RoundTripper) ClientOption {
 	return func(o *clientOptions) error {
@@ -216,6 +243,21 @@ func WithTransport(tr http.RoundTripper) ClientOption {
 			return err
 		}
 		o.transport = tr
+		return nil
+	}
+}
+
+// WithInsecure adds a insecure transport that bypasses TLS verification.
+func WithInsecure() ClientOption {
+	return func(o *clientOptions) error {
+		o.transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				//nolint:gosec // insecure option
+				InsecureSkipVerify: true,
+			},
+		}
 		return nil
 	}
 }
@@ -259,9 +301,48 @@ func WithCABundle(bundle []byte) ClientOption {
 
 // WithCertificate will set the given certificate as the TLS client certificate
 // in the client.
-func WithCertificate(crt tls.Certificate) ClientOption {
+func WithCertificate(cert tls.Certificate) ClientOption {
 	return func(o *clientOptions) error {
-		o.certificate = crt
+		o.certificate = cert
+		return nil
+	}
+}
+
+// WithAdminX5C will set the given file as the X5C certificate for use
+// by the client.
+func WithAdminX5C(certs []*x509.Certificate, key interface{}, passwordFile string) ClientOption {
+	return func(o *clientOptions) error {
+		// Get private key from given key file
+		var (
+			err  error
+			opts []jose.Option
+		)
+		if passwordFile != "" {
+			opts = append(opts, jose.WithPasswordFile(passwordFile))
+		}
+		blk, err := pemutil.Serialize(key)
+		if err != nil {
+			return errors.Wrap(err, "error serializing private key")
+		}
+		o.x5cJWK, err = jose.ParseKey(pem.EncodeToMemory(blk), opts...)
+		if err != nil {
+			return err
+		}
+		o.x5cCertStrs, err = jose.ValidateX5C(certs, o.x5cJWK.Key)
+		if err != nil {
+			return errors.Wrap(err, "error validating x5c certificate chain and key for use in x5c header")
+		}
+
+		o.x5cCert = certs[0]
+		switch leaf := certs[0]; {
+		case leaf.Subject.CommonName != "":
+			o.x5cSubject = leaf.Subject.CommonName
+		case len(leaf.DNSNames) > 0:
+			o.x5cSubject = leaf.DNSNames[0]
+		case len(leaf.EmailAddresses) > 0:
+			o.x5cSubject = leaf.EmailAddresses[0]
+		}
+
 		return nil
 	}
 }
@@ -275,7 +356,7 @@ func WithRetryFunc(fn RetryFunc) ClientOption {
 }
 
 func getTransportFromFile(filename string) (http.RoundTripper, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", filename)
 	}
@@ -287,7 +368,7 @@ func getTransportFromFile(filename string) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 func getTransportFromSHA256(endpoint, sum string) (http.RoundTripper, error) {
@@ -306,7 +387,7 @@ func getTransportFromSHA256(endpoint, sum string) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 func getTransportFromCABundle(bundle []byte) (http.RoundTripper, error) {
@@ -318,7 +399,7 @@ func getTransportFromCABundle(bundle []byte) (http.RoundTripper, error) {
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  pool,
-	})
+	}), nil
 }
 
 // parseEndpoint parses and validates the given endpoint. It supports general
@@ -360,14 +441,18 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 }
 
 // ProvisionerOption is the type of options passed to the Provisioner method.
-type ProvisionerOption func(o *provisionerOptions) error
+type ProvisionerOption func(o *ProvisionerOptions) error
 
-type provisionerOptions struct {
-	cursor string
-	limit  int
+// ProvisionerOptions stores options for the provisioner CRUD API.
+type ProvisionerOptions struct {
+	Cursor string
+	Limit  int
+	ID     string
+	Name   string
 }
 
-func (o *provisionerOptions) apply(opts []ProvisionerOption) (err error) {
+// Apply caches provisioner options on a struct for later use.
+func (o *ProvisionerOptions) Apply(opts []ProvisionerOption) (err error) {
 	for _, fn := range opts {
 		if err = fn(o); err != nil {
 			return
@@ -376,29 +461,51 @@ func (o *provisionerOptions) apply(opts []ProvisionerOption) (err error) {
 	return
 }
 
-func (o *provisionerOptions) rawQuery() string {
+func (o *ProvisionerOptions) rawQuery() string {
 	v := url.Values{}
-	if len(o.cursor) > 0 {
-		v.Set("cursor", o.cursor)
+	if o.Cursor != "" {
+		v.Set("cursor", o.Cursor)
 	}
-	if o.limit > 0 {
-		v.Set("limit", strconv.Itoa(o.limit))
+	if o.Limit > 0 {
+		v.Set("limit", strconv.Itoa(o.Limit))
+	}
+	if o.ID != "" {
+		v.Set("id", o.ID)
+	}
+	if o.Name != "" {
+		v.Set("name", o.Name)
 	}
 	return v.Encode()
 }
 
 // WithProvisionerCursor will request the provisioners starting with the given cursor.
 func WithProvisionerCursor(cursor string) ProvisionerOption {
-	return func(o *provisionerOptions) error {
-		o.cursor = cursor
+	return func(o *ProvisionerOptions) error {
+		o.Cursor = cursor
 		return nil
 	}
 }
 
 // WithProvisionerLimit will request the given number of provisioners.
 func WithProvisionerLimit(limit int) ProvisionerOption {
-	return func(o *provisionerOptions) error {
-		o.limit = limit
+	return func(o *ProvisionerOptions) error {
+		o.Limit = limit
+		return nil
+	}
+}
+
+// WithProvisionerID will request the given provisioner.
+func WithProvisionerID(id string) ProvisionerOption {
+	return func(o *ProvisionerOptions) error {
+		o.ID = id
+		return nil
+	}
+}
+
+// WithProvisionerName will request the given provisioner.
+func WithProvisionerName(name string) ProvisionerOption {
+	return func(o *ProvisionerOptions) error {
+		o.Name = name
 		return nil
 	}
 }
@@ -454,6 +561,11 @@ func (c *Client) retryOnError(r *http.Response) bool {
 	return false
 }
 
+// GetCaURL returns the configured CA url.
+func (c *Client) GetCaURL() string {
+	return c.endpoint.String()
+}
+
 // GetRootCAs returns the RootCAs certificate pool from the configured
 // transport.
 func (c *Client) GetRootCAs() *x509.CertPool {
@@ -478,18 +590,24 @@ func (c *Client) SetTransport(tr http.RoundTripper) {
 	c.client.SetTransport(tr)
 }
 
-// Version performs the version request to the CA and returns the
+// Version performs the version request to the CA with an empty context and returns the
 // api.VersionResponse struct.
 func (c *Client) Version() (*api.VersionResponse, error) {
+	return c.VersionWithContext(context.Background())
+}
+
+// VersionWithContext performs the version request to the CA with the provided context
+// and returns the api.VersionResponse struct.
+func (c *Client) VersionWithContext(ctx context.Context) (*api.VersionResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/version"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Version; client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -502,18 +620,24 @@ retry:
 	return &version, nil
 }
 
-// Health performs the health request to the CA and returns the
-// api.HealthResponse struct.
+// Health performs the health request to the CA with an empty context
+// and returns the api.HealthResponse struct.
 func (c *Client) Health() (*api.HealthResponse, error) {
+	return c.HealthWithContext(context.Background())
+}
+
+// HealthWithContext performs the health request to the CA with the provided context
+// and returns the api.HealthResponse struct.
+func (c *Client) HealthWithContext(ctx context.Context) (*api.HealthResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/health"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Health; client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -526,21 +650,29 @@ retry:
 	return &health, nil
 }
 
-// Root performs the root request to the CA with the given SHA256 and returns
-// the api.RootResponse struct. It uses an insecure client, but it checks the
-// resulting root certificate with the given SHA256, returning an error if they
-// do not match.
+// Root performs the root request to the CA with an empty context and the provided
+// SHA256 and returns the api.RootResponse struct. It uses an insecure client, but
+// it checks the resulting root certificate with the given SHA256, returning an error
+// if they do not match.
 func (c *Client) Root(sha256Sum string) (*api.RootResponse, error) {
+	return c.RootWithContext(context.Background(), sha256Sum)
+}
+
+// RootWithContext performs the root request to the CA with an empty context and the provided
+// SHA256 and returns the api.RootResponse struct. It uses an insecure client, but
+// it checks the resulting root certificate with the given SHA256, returning an error
+// if they do not match.
+func (c *Client) RootWithContext(ctx context.Context, sha256Sum string) (*api.RootResponse, error) {
 	var retried bool
-	sha256Sum = strings.ToLower(strings.Replace(sha256Sum, "-", "", -1))
+	sha256Sum = strings.ToLower(strings.ReplaceAll(sha256Sum, "-", ""))
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/root/" + sha256Sum})
 retry:
-	resp, err := newInsecureClient().Get(u.String())
+	resp, err := newInsecureClient().GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Root; client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -552,15 +684,21 @@ retry:
 	}
 	// verify the sha256
 	sum := sha256.Sum256(root.RootPEM.Raw)
-	if sha256Sum != strings.ToLower(hex.EncodeToString(sum[:])) {
-		return nil, errs.BadRequest("client.Root; root certificate SHA256 fingerprint do not match")
+	if !strings.EqualFold(sha256Sum, strings.ToLower(hex.EncodeToString(sum[:]))) {
+		return nil, errs.BadRequest("root certificate fingerprint does not match")
 	}
 	return &root, nil
 }
 
-// Sign performs the sign request to the CA and returns the api.SignResponse
-// struct.
+// Sign performs the sign request to the CA with an empty context and returns
+// the api.SignResponse struct.
 func (c *Client) Sign(req *api.SignRequest) (*api.SignResponse, error) {
+	return c.SignWithContext(context.Background(), req)
+}
+
+// SignWithContext performs the sign request to the CA with the provided context
+// and returns the api.SignResponse struct.
+func (c *Client) SignWithContext(ctx context.Context, req *api.SignRequest) (*api.SignResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -568,12 +706,12 @@ func (c *Client) Sign(req *api.SignRequest) (*api.SignResponse, error) {
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/sign"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Sign; client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -589,19 +727,30 @@ retry:
 	return &sign, nil
 }
 
-// Renew performs the renew request to the CA and returns the api.SignResponse
-// struct.
+// Renew performs the renew request to the CA with an empty context and
+// returns the api.SignResponse struct.
 func (c *Client) Renew(tr http.RoundTripper) (*api.SignResponse, error) {
+	return c.RenewWithContext(context.Background(), tr)
+}
+
+// RenewWithContext performs the renew request to the CA with the provided context
+// and returns the api.SignResponse struct.
+func (c *Client) RenewWithContext(ctx context.Context, tr http.RoundTripper) (*api.SignResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/renew"})
 	client := &http.Client{Transport: tr}
 retry:
-	resp, err := client.Post(u.String(), "application/json", http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), http.NoBody)
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Renew; client POST %s failed", u)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -614,9 +763,92 @@ retry:
 	return &sign, nil
 }
 
-// Revoke performs the revoke request to the CA and returns the api.RevokeResponse
-// struct.
+// RenewWithToken performs the renew request to the CA with the given
+// authorization token and and empty context and returns the api.SignResponse struct.
+// This method is generally used to renew an expired certificate.
+func (c *Client) RenewWithToken(token string) (*api.SignResponse, error) {
+	return c.RenewWithTokenAndContext(context.Background(), token)
+}
+
+// RenewWithTokenAndContext performs the renew request to the CA with the given
+// authorization token and context and returns the api.SignResponse struct.
+// This method is generally used to renew an expired certificate.
+func (c *Client) RenewWithTokenAndContext(ctx context.Context, token string) (*api.SignResponse, error) {
+	var retried bool
+	u := c.endpoint.ResolveReference(&url.URL{Path: "/renew"})
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), http.NoBody)
+	if err != nil {
+		return nil, errors.Wrapf(err, "create POST %s request failed", u)
+	}
+	req.Header.Add("Authorization", "Bearer "+token)
+retry:
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, clientError(err)
+	}
+	if resp.StatusCode >= 400 {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
+			retried = true
+			goto retry
+		}
+		return nil, readError(resp.Body)
+	}
+	var sign api.SignResponse
+	if err := readJSON(resp.Body, &sign); err != nil {
+		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.RenewWithToken; error reading %s", u)
+	}
+	return &sign, nil
+}
+
+// Rekey performs the rekey request to the CA with an empty context and
+// returns the api.SignResponse struct.
+func (c *Client) Rekey(req *api.RekeyRequest, tr http.RoundTripper) (*api.SignResponse, error) {
+	return c.RekeyWithContext(context.Background(), req, tr)
+}
+
+// RekeyWithContext performs the rekey request to the CA with the provided context
+// and returns the api.SignResponse struct.
+func (c *Client) RekeyWithContext(ctx context.Context, req *api.RekeyRequest, tr http.RoundTripper) (*api.SignResponse, error) {
+	var retried bool
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshaling request")
+	}
+	u := c.endpoint.ResolveReference(&url.URL{Path: "/rekey"})
+	client := &http.Client{Transport: tr}
+retry:
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, clientError(err)
+	}
+	if resp.StatusCode >= 400 {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
+			retried = true
+			goto retry
+		}
+		return nil, readError(resp.Body)
+	}
+	var sign api.SignResponse
+	if err := readJSON(resp.Body, &sign); err != nil {
+		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client.Rekey; error reading %s", u)
+	}
+	return &sign, nil
+}
+
+// Revoke performs the revoke request to the CA with an empty context and returns
+// the api.RevokeResponse struct.
 func (c *Client) Revoke(req *api.RevokeRequest, tr http.RoundTripper) (*api.RevokeResponse, error) {
+	return c.RevokeWithContext(context.Background(), req, tr)
+}
+
+// RevokeWithContext performs the revoke request to the CA with the provided context and
+// returns the api.RevokeResponse struct.
+func (c *Client) RevokeWithContext(ctx context.Context, req *api.RevokeRequest, tr http.RoundTripper) (*api.RevokeResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -631,12 +863,12 @@ retry:
 	}
 
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/revoke"})
-	resp, err := client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -649,15 +881,24 @@ retry:
 	return &revoke, nil
 }
 
-// Provisioners performs the provisioners request to the CA and returns the
-// api.ProvisionersResponse struct with a map of provisioners.
+// Provisioners performs the provisioners request to the CA with an empty context
+// and returns the api.ProvisionersResponse struct with a map of provisioners.
 //
 // ProvisionerOption WithProvisionerCursor and WithProvisionLimit can be used to
 // paginate the provisioners.
 func (c *Client) Provisioners(opts ...ProvisionerOption) (*api.ProvisionersResponse, error) {
+	return c.ProvisionersWithContext(context.Background(), opts...)
+}
+
+// ProvisionersWithContext performs the provisioners request to the CA with the provided context
+// and returns the api.ProvisionersResponse struct with a map of provisioners.
+//
+// ProvisionerOption WithProvisionerCursor and WithProvisionLimit can be used to
+// paginate the provisioners.
+func (c *Client) ProvisionersWithContext(ctx context.Context, opts ...ProvisionerOption) (*api.ProvisionersResponse, error) {
 	var retried bool
-	o := new(provisionerOptions)
-	if err := o.apply(opts); err != nil {
+	o := new(ProvisionerOptions)
+	if err := o.Apply(opts); err != nil {
 		return nil, err
 	}
 	u := c.endpoint.ResolveReference(&url.URL{
@@ -665,12 +906,12 @@ func (c *Client) Provisioners(opts ...ProvisionerOption) (*api.ProvisionersRespo
 		RawQuery: o.rawQuery(),
 	})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -683,19 +924,26 @@ retry:
 	return &provisioners, nil
 }
 
-// ProvisionerKey performs the request to the CA to get the encrypted key for
-// the given provisioner kid and returns the api.ProvisionerKeyResponse struct
-// with the encrypted key.
+// ProvisionerKey performs the request to the CA with an empty context to get
+// the encrypted key for the given provisioner kid and returns the api.ProvisionerKeyResponse
+// struct with the encrypted key.
 func (c *Client) ProvisionerKey(kid string) (*api.ProvisionerKeyResponse, error) {
+	return c.ProvisionerKeyWithContext(context.Background(), kid)
+}
+
+// ProvisionerKeyWithContext performs the request to the CA with the provided context to get
+// the encrypted key for the given provisioner kid and returns the api.ProvisionerKeyResponse
+// struct with the encrypted key.
+func (c *Client) ProvisionerKeyWithContext(ctx context.Context, kid string) (*api.ProvisionerKeyResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/provisioners/" + kid + "/encrypted-key"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -708,18 +956,24 @@ retry:
 	return &key, nil
 }
 
-// Roots performs the get roots request to the CA and returns the
-// api.RootsResponse struct.
+// Roots performs the get roots request to the CA with an empty context
+// and returns the api.RootsResponse struct.
 func (c *Client) Roots() (*api.RootsResponse, error) {
+	return c.RootsWithContext(context.Background())
+}
+
+// RootsWithContext performs the get roots request to the CA with the provided context
+// and returns the api.RootsResponse struct.
+func (c *Client) RootsWithContext(ctx context.Context) (*api.RootsResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/roots"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -732,18 +986,24 @@ retry:
 	return &roots, nil
 }
 
-// Federation performs the get federation request to the CA and returns the
-// api.FederationResponse struct.
+// Federation performs the get federation request to the CA with an empty context
+// and returns the api.FederationResponse struct.
 func (c *Client) Federation() (*api.FederationResponse, error) {
+	return c.FederationWithContext(context.Background())
+}
+
+// FederationWithContext performs the get federation request to the CA with the provided context
+// and returns the api.FederationResponse struct.
+func (c *Client) FederationWithContext(ctx context.Context) (*api.FederationResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/federation"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -756,9 +1016,15 @@ retry:
 	return &federation, nil
 }
 
-// SSHSign performs the POST /ssh/sign request to the CA and returns the
-// api.SSHSignResponse struct.
+// SSHSign performs the POST /ssh/sign request to the CA with an empty context
+// and returns the api.SSHSignResponse struct.
 func (c *Client) SSHSign(req *api.SSHSignRequest) (*api.SSHSignResponse, error) {
+	return c.SSHSignWithContext(context.Background(), req)
+}
+
+// SSHSignWithContext performs the POST /ssh/sign request to the CA with the provided context
+// and returns the api.SSHSignResponse struct.
+func (c *Client) SSHSignWithContext(ctx context.Context, req *api.SSHSignRequest) (*api.SSHSignResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -766,12 +1032,12 @@ func (c *Client) SSHSign(req *api.SSHSignRequest) (*api.SSHSignResponse, error) 
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/sign"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -784,9 +1050,15 @@ retry:
 	return &sign, nil
 }
 
-// SSHRenew performs the POST /ssh/renew request to the CA and returns the
-// api.SSHRenewResponse struct.
+// SSHRenew performs the POST /ssh/renew request to the CA with an empty context
+// and returns the api.SSHRenewResponse struct.
 func (c *Client) SSHRenew(req *api.SSHRenewRequest) (*api.SSHRenewResponse, error) {
+	return c.SSHRenewWithContext(context.Background(), req)
+}
+
+// SSHRenewWithContext performs the POST /ssh/renew request to the CA with the provided context
+// and returns the api.SSHRenewResponse struct.
+func (c *Client) SSHRenewWithContext(ctx context.Context, req *api.SSHRenewRequest) (*api.SSHRenewResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -794,12 +1066,12 @@ func (c *Client) SSHRenew(req *api.SSHRenewRequest) (*api.SSHRenewResponse, erro
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/renew"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -812,9 +1084,15 @@ retry:
 	return &renew, nil
 }
 
-// SSHRekey performs the POST /ssh/rekey request to the CA and returns the
-// api.SSHRekeyResponse struct.
+// SSHRekey performs the POST /ssh/rekey request to the CA with an empty context
+// and returns the api.SSHRekeyResponse struct.
 func (c *Client) SSHRekey(req *api.SSHRekeyRequest) (*api.SSHRekeyResponse, error) {
+	return c.SSHRekeyWithContext(context.Background(), req)
+}
+
+// SSHRekeyWithContext performs the POST /ssh/rekey request to the CA with the provided context
+// and returns the api.SSHRekeyResponse struct.
+func (c *Client) SSHRekeyWithContext(ctx context.Context, req *api.SSHRekeyRequest) (*api.SSHRekeyResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -822,12 +1100,12 @@ func (c *Client) SSHRekey(req *api.SSHRekeyRequest) (*api.SSHRekeyResponse, erro
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/rekey"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -840,9 +1118,15 @@ retry:
 	return &rekey, nil
 }
 
-// SSHRevoke performs the POST /ssh/revoke request to the CA and returns the
-// api.SSHRevokeResponse struct.
+// SSHRevoke performs the POST /ssh/revoke request to the CA with an empty context
+// and returns the api.SSHRevokeResponse struct.
 func (c *Client) SSHRevoke(req *api.SSHRevokeRequest) (*api.SSHRevokeResponse, error) {
+	return c.SSHRevokeWithContext(context.Background(), req)
+}
+
+// SSHRevokeWithContext performs the POST /ssh/revoke request to the CA with the provided context
+// and returns the api.SSHRevokeResponse struct.
+func (c *Client) SSHRevokeWithContext(ctx context.Context, req *api.SSHRevokeRequest) (*api.SSHRevokeResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -850,12 +1134,12 @@ func (c *Client) SSHRevoke(req *api.SSHRevokeRequest) (*api.SSHRevokeResponse, e
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/revoke"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -868,18 +1152,24 @@ retry:
 	return &revoke, nil
 }
 
-// SSHRoots performs the GET /ssh/roots request to the CA and returns the
-// api.SSHRootsResponse struct.
+// SSHRoots performs the GET /ssh/roots request to the CA with an empty context
+// and returns the api.SSHRootsResponse struct.
 func (c *Client) SSHRoots() (*api.SSHRootsResponse, error) {
+	return c.SSHRootsWithContext(context.Background())
+}
+
+// SSHRootsWithContext performs the GET /ssh/roots request to the CA with the provided context
+// and returns the api.SSHRootsResponse struct.
+func (c *Client) SSHRootsWithContext(ctx context.Context) (*api.SSHRootsResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/roots"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -892,18 +1182,24 @@ retry:
 	return &keys, nil
 }
 
-// SSHFederation performs the get /ssh/federation request to the CA and returns
-// the api.SSHRootsResponse struct.
+// SSHFederation performs the get /ssh/federation request to the CA with an empty context
+// and returns the api.SSHRootsResponse struct.
 func (c *Client) SSHFederation() (*api.SSHRootsResponse, error) {
+	return c.SSHFederationWithContext(context.Background())
+}
+
+// SSHFederationWithContext performs the get /ssh/federation request to the CA with the provided context
+// and returns the api.SSHRootsResponse struct.
+func (c *Client) SSHFederationWithContext(ctx context.Context) (*api.SSHRootsResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/federation"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -916,9 +1212,15 @@ retry:
 	return &keys, nil
 }
 
-// SSHConfig performs the POST /ssh/config request to the CA to get the ssh
-// configuration templates.
+// SSHConfig performs the POST /ssh/config request to the CA with an empty context
+// to get the ssh configuration templates.
 func (c *Client) SSHConfig(req *api.SSHConfigRequest) (*api.SSHConfigResponse, error) {
+	return c.SSHConfigWithContext(context.Background(), req)
+}
+
+// SSHConfigWithContext performs the POST /ssh/config request to the CA with the provided context
+// to get the ssh configuration templates.
+func (c *Client) SSHConfigWithContext(ctx context.Context, req *api.SSHConfigRequest) (*api.SSHConfigResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -926,27 +1228,33 @@ func (c *Client) SSHConfig(req *api.SSHConfigRequest) (*api.SSHConfigResponse, e
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/config"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
 		return nil, readError(resp.Body)
 	}
-	var config api.SSHConfigResponse
-	if err := readJSON(resp.Body, &config); err != nil {
+	var cfg api.SSHConfigResponse
+	if err := readJSON(resp.Body, &cfg); err != nil {
 		return nil, errors.Wrapf(err, "error reading %s", u)
 	}
-	return &config, nil
+	return &cfg, nil
 }
 
-// SSHCheckHost performs the POST /ssh/check-host request to the CA with the
-// given principal.
-func (c *Client) SSHCheckHost(principal string, token string) (*api.SSHCheckPrincipalResponse, error) {
+// SSHCheckHost performs the POST /ssh/check-host request to the CA with an empty context,
+// the principal and a token and returns the api.SSHCheckPrincipalResponse.
+func (c *Client) SSHCheckHost(principal, token string) (*api.SSHCheckPrincipalResponse, error) {
+	return c.SSHCheckHostWithContext(context.Background(), principal, token)
+}
+
+// SSHCheckHostWithContext performs the POST /ssh/check-host request to the CA with the provided context,
+// principal and token and returns the api.SSHCheckPrincipalResponse.
+func (c *Client) SSHCheckHostWithContext(ctx context.Context, principal, token string) (*api.SSHCheckPrincipalResponse, error) {
 	var retried bool
 	body, err := json.Marshal(&api.SSHCheckPrincipalRequest{
 		Type:      provisioner.SSHHostCert,
@@ -959,38 +1267,41 @@ func (c *Client) SSHCheckHost(principal string, token string) (*api.SSHCheckPrin
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/check-host"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errs.Wrapf(http.StatusInternalServerError, err, "client POST %s failed",
-			[]interface{}{u, errs.WithMessage("Failed to perform POST request to %s", u)}...)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
-
-		return nil, errs.StatusCodeError(resp.StatusCode, readError(resp.Body))
+		return nil, readError(resp.Body)
 	}
 	var check api.SSHCheckPrincipalResponse
 	if err := readJSON(resp.Body, &check); err != nil {
 		return nil, errs.Wrapf(http.StatusInternalServerError, err, "error reading %s response",
-			[]interface{}{u, errs.WithMessage("Failed to parse response from /ssh/check-host endpoint")})
+			[]any{u, errs.WithMessage("Failed to parse response from /ssh/check-host endpoint")}...)
 	}
 	return &check, nil
 }
 
-// SSHGetHosts performs the GET /ssh/get-hosts request to the CA.
+// SSHGetHosts performs the GET /ssh/get-hosts request to the CA with an empty context.
 func (c *Client) SSHGetHosts() (*api.SSHGetHostsResponse, error) {
+	return c.SSHGetHostsWithContext(context.Background())
+}
+
+// SSHGetHostsWithContext performs the GET /ssh/get-hosts request to the CA with the provided context.
+func (c *Client) SSHGetHostsWithContext(ctx context.Context) (*api.SSHGetHostsResponse, error) {
 	var retried bool
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/hosts"})
 retry:
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "client GET %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -1003,8 +1314,13 @@ retry:
 	return &hosts, nil
 }
 
-// SSHBastion performs the POST /ssh/bastion request to the CA.
+// SSHBastion performs the POST /ssh/bastion request to the CA with an empty context.
 func (c *Client) SSHBastion(req *api.SSHBastionRequest) (*api.SSHBastionResponse, error) {
+	return c.SSHBastionWithContext(context.Background(), req)
+}
+
+// SSHBastionWithContext performs the POST /ssh/bastion request to the CA with the provided context.
+func (c *Client) SSHBastionWithContext(ctx context.Context, req *api.SSHBastionRequest) (*api.SSHBastionResponse, error) {
 	var retried bool
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -1012,12 +1328,12 @@ func (c *Client) SSHBastion(req *api.SSHBastionRequest) (*api.SSHBastionResponse
 	}
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/ssh/bastion"})
 retry:
-	resp, err := c.client.Post(u.String(), "application/json", bytes.NewReader(body))
+	resp, err := c.client.PostWithContext(ctx, u.String(), "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, errors.Wrapf(err, "client.SSHBastion; client POST %s failed", u)
+		return nil, clientError(err)
 	}
 	if resp.StatusCode >= 400 {
-		if !retried && c.retryOnError(resp) {
+		if !retried && c.retryOnError(resp) { //nolint:contextcheck // deeply nested context; retry using the same context
 			retried = true
 			goto retry
 		}
@@ -1031,14 +1347,20 @@ retry:
 }
 
 // RootFingerprint is a helper method that returns the current root fingerprint.
-// It does an health connection and gets the fingerprint from the TLS verified
-// chains.
+// It does an health connection and gets the fingerprint from the TLS verified chains.
 func (c *Client) RootFingerprint() (string, error) {
+	return c.RootFingerprintWithContext(context.Background())
+}
+
+// RootFingerprintWithContext is a helper method that returns the current root fingerprint.
+// It does an health connection and gets the fingerprint from the TLS verified chains.
+func (c *Client) RootFingerprintWithContext(ctx context.Context) (string, error) {
 	u := c.endpoint.ResolveReference(&url.URL{Path: "/health"})
-	resp, err := c.client.Get(u.String())
+	resp, err := c.client.GetWithContext(ctx, u.String())
 	if err != nil {
-		return "", errors.Wrapf(err, "client GET %s failed", u)
+		return "", clientError(err)
 	}
+	defer resp.Body.Close()
 	if resp.TLS == nil || len(resp.TLS.VerifiedChains) == 0 {
 		return "", errors.New("missing verified chains")
 	}
@@ -1102,7 +1424,7 @@ func CreateSignRequest(ott string) (*api.SignRequest, crypto.PrivateKey, error) 
 // CreateCertificateRequest creates a new CSR with the given common name and
 // SANs. If no san is provided the commonName will set also a SAN.
 func CreateCertificateRequest(commonName string, sans ...string) (*api.CertificateRequest, crypto.PrivateKey, error) {
-	key, err := keys.GenerateDefaultKey()
+	key, err := keyutil.GenerateDefaultKey()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1166,12 +1488,21 @@ func createCertificateRequest(commonName string, sans []string, key crypto.Priva
 // getRootCAPath returns the path where the root CA is stored based on the
 // STEPPATH environment variable.
 func getRootCAPath() string {
-	return filepath.Join(config.StepPath(), "certs", "root_ca.crt")
+	return filepath.Join(step.Path(), "certs", "root_ca.crt")
 }
 
 func readJSON(r io.ReadCloser, v interface{}) error {
 	defer r.Close()
 	return json.NewDecoder(r).Decode(v)
+}
+
+func readProtoJSON(r io.ReadCloser, m proto.Message) error {
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	return protojson.Unmarshal(data, m)
 }
 
 func readError(r io.ReadCloser) error {
@@ -1181,4 +1512,13 @@ func readError(r io.ReadCloser) error {
 		return err
 	}
 	return apiErr
+}
+
+func clientError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("client %s %s failed: %w",
+			strings.ToUpper(uerr.Op), uerr.URL, uerr.Err)
+	}
+	return fmt.Errorf("client request failed: %w", err)
 }
